@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-SC Log Tracker - a real-time viewer for the Star Citizen Game.log.
+SC Log Tracker - a real-time viewer and history for the Star Citizen Game.log.
 
-Follows the Game.log while you play, turns the raw lines into readable events
-and shows them in a local browser page:
+Follows the Game.log while you play, turns the raw lines into readable events,
+keeps a complete history of all your sessions and shows everything in a local
+browser dashboard:
 
-  * live event feed (travel, ship, missions, trade, combat, law, party, errors)
+  * live event feed with date/time range filter and session history
   * "Now" panel (location, jurisdiction, zone, ship, quantum target, server)
-  * session statistics
+  * automatic import of the logs Star Citizen keeps in logbackups
   * raw log view with search, filter and auto-scroll
 
 Pure Python standard library, Python 3.9+.
@@ -15,41 +16,49 @@ Pure Python standard library, Python 3.9+.
 Usage:
     python sc_log_tracker.py                       find the Game.log automatically
     python sc_log_tracker.py "D:\\Games\\StarCitizen\\LIVE"
-    python sc_log_tracker.py --replay last         replay the newest file in logbackups
-    python sc_log_tracker.py --replay old.log --speed 60
+    python sc_log_tracker.py --background          no browser, no window (autostart)
+    python sc_log_tracker.py --replay old.log      replay a log file (not saved to history)
 
-Anti-cheat: the tool only reads the text file the game writes itself. No memory
-access, no injection, no hooks. The file is opened briefly on every poll and
+Anti-cheat: the tool only reads the text files the game writes itself. No memory
+access, no injection, no hooks. The log is opened briefly on every poll and
 closed again, so the game can move it to logbackups on its next start.
 """
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import queue
 import re
+import sqlite3
 import string
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 APP_NAME = "SC Log Tracker"
 REPO_URL = "https://github.com/DefaultHahn/sc-log-tracker"
 DEFAULT_PORT = 8777
+PORT_RANGE = 15
 CHANNELS = ("LIVE", "PTU", "EPTU", "TECH-PREVIEW", "HOTFIX")
+# Bump when the parser produces different events, so stored history is re-imported
+# from every log file that still exists.
+PARSER_VERSION = 2
 
 POLL_SECONDS = 0.25
 READ_CHUNK = 4 * 1024 * 1024
 HEAD_BYTES = 256
 RAW_KEEP = 1500          # raw lines a newly connected browser receives
-EVENTS_KEEP = 20000      # events kept in memory per session
-SNAPSHOT_EVENTS = 6000   # events sent in the initial snapshot
+EVENTS_LIMIT = 20000     # max events returned for one time range
+CSRF_HEADER = "X-SC-Log-Tracker"
 
 
 def app_dir():
@@ -59,13 +68,20 @@ def app_dir():
     return Path(__file__).resolve().parent
 
 
+def default_data_dir():
+    """Where settings and the history database live. Survives app updates and moves."""
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.path.join(Path.home(), "AppData", "Local")
+        return Path(base) / "SC Log Tracker"
+    base = os.environ.get("XDG_DATA_HOME") or os.path.join(Path.home(), ".local", "share")
+    return Path(base) / "sc-log-tracker"
+
+
+DATA_DIR = default_data_dir()
+
+
 def config_path():
-    """sc_log_tracker.json next to the app, or in the user profile if that folder is read-only."""
-    local = app_dir() / "sc_log_tracker.json"
-    if os.access(local.parent, os.W_OK):
-        return local
-    base = os.environ.get("LOCALAPPDATA") or os.path.join(Path.home(), ".config")
-    return Path(base) / "SC Log Tracker" / "sc_log_tracker.json"
+    return DATA_DIR / "settings.json"
 
 
 # ---------------------------------------------------------------------------
@@ -980,23 +996,164 @@ class Parser:
 
 
 # ---------------------------------------------------------------------------
-# Hub: holds the state and fans it out to connected browsers
+# History store (SQLite)
+# ---------------------------------------------------------------------------
+
+def session_key(first_line):
+    """Stable id for one game session: its first log line (timestamp + backup name)."""
+    if isinstance(first_line, str):
+        first_line = first_line.encode("utf-8", "replace")
+    return hashlib.sha1(first_line.strip()).hexdigest()[:16]
+
+
+def first_line_of(path):
+    """First complete line of a file, or None if there is none yet."""
+    try:
+        with open(path, "rb") as f:
+            line = f.readline(8192)
+    except OSError:
+        return None
+    return line if line.endswith(b"\n") else None
+
+
+class Store:
+    """All events of all sessions, so the history survives Star Citizen deleting old logs."""
+
+    SCHEMA = """
+    CREATE TABLE IF NOT EXISTS sessions(
+        id TEXT PRIMARY KEY, path TEXT, first_ts TEXT, last_ts TEXT,
+        size INTEGER DEFAULT 0, lines INTEGER DEFAULT 0, events INTEGER DEFAULT 0,
+        handle TEXT, version TEXT, channel TEXT, parser INTEGER DEFAULT 0, updated REAL);
+    CREATE TABLE IF NOT EXISTS events(
+        id INTEGER PRIMARY KEY, sid TEXT NOT NULL, seq INTEGER NOT NULL,
+        ts TEXT, c TEXT, ti TEXT, d TEXT, lv TEXT, n INTEGER, raw TEXT,
+        UNIQUE(sid, seq));
+    CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
+    CREATE INDEX IF NOT EXISTS sessions_first ON sessions(first_ts);
+    """
+
+    def __init__(self, path):
+        self.path = str(path)
+        self.lock = threading.RLock()
+        if self.path != ":memory:":
+            Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
+        self.db.row_factory = sqlite3.Row
+        with self.lock:
+            if self.path != ":memory:":
+                self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.execute("PRAGMA synchronous=NORMAL")
+            self.db.executescript(self.SCHEMA)
+            self.db.commit()
+
+    def close(self):
+        with self.lock:
+            self.db.close()
+
+    def begin_session(self, sid, path):
+        """Register a session. Events from an older parser version are dropped and re-parsed."""
+        with self.lock:
+            row = self.db.execute("SELECT parser FROM sessions WHERE id=?", (sid,)).fetchone()
+            if row and row["parser"] != PARSER_VERSION:
+                self.db.execute("DELETE FROM events WHERE sid=?", (sid,))
+                self.db.execute("UPDATE sessions SET size=0 WHERE id=?", (sid,))
+            self.db.execute(
+                "INSERT INTO sessions(id, path, parser, updated) VALUES(?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET path=excluded.path, parser=excluded.parser, updated=excluded.updated",
+                (sid, str(path), PARSER_VERSION, time.time()))
+            self.db.commit()
+
+    def add_events(self, sid, events):
+        """Store events (duplicates are ignored). Returns the newly stored ones with their database id."""
+        new = []
+        if not events:
+            return new
+        with self.lock:
+            cur = self.db.cursor()
+            for e in events:
+                cur.execute(
+                    "INSERT OR IGNORE INTO events(sid, seq, ts, c, ti, d, lv, n, raw) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (sid, e["id"], e["ts"], e["c"], e["ti"], e["d"], e["lv"], e["n"], e["raw"]))
+                if cur.rowcount:
+                    new.append(dict(e, id=cur.lastrowid, seq=e["id"], sid=sid))
+            self.db.commit()
+        return new
+
+    def update_session(self, sid, state, size=None):
+        with self.lock:
+            count = self.db.execute("SELECT COUNT(*) FROM events WHERE sid=?", (sid,)).fetchone()[0]
+            self.db.execute(
+                "UPDATE sessions SET first_ts=?, last_ts=?, lines=?, events=?, handle=?, version=?, channel=?, "
+                "size=COALESCE(?, size), updated=? WHERE id=?",
+                (state.get("first_ts"), state.get("last_ts"), state.get("lines", 0), count, state.get("handle"),
+                 state.get("version"), state.get("channel"), size, time.time(), sid))
+            self.db.commit()
+
+    def session(self, sid):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM sessions WHERE id=?", (sid,)).fetchone()
+        return dict(row) if row else None
+
+    def sessions(self, limit=2000):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT id, path, first_ts, last_ts, events, handle, version, channel FROM sessions "
+                "WHERE events > 0 AND first_ts IS NOT NULL ORDER BY first_ts DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def events(self, frm=None, to=None, limit=EVENTS_LIMIT):
+        """Events between two ISO timestamps (UTC), oldest first. Returns (events, total in range)."""
+        where, args = ["ts IS NOT NULL"], []
+        if frm:
+            where.append("ts >= ?")
+            args.append(frm)
+        if to:
+            where.append("ts <= ?")
+            args.append(to)
+        cond = " AND ".join(where)
+        with self.lock:
+            total = self.db.execute(f"SELECT COUNT(*) FROM events WHERE {cond}", args).fetchone()[0]
+            rows = self.db.execute(
+                f"SELECT id, sid, seq, ts, c, ti, d, lv, n, raw FROM events WHERE {cond} "
+                "ORDER BY ts DESC, id DESC LIMIT ?", args + [limit]).fetchall()
+        return [dict(r) for r in reversed(rows)], total
+
+    def stats(self):
+        with self.lock:
+            row = self.db.execute(
+                "SELECT COUNT(*) AS sessions, COALESCE(SUM(events), 0) AS events, MIN(first_ts) AS oldest "
+                "FROM sessions WHERE events > 0").fetchone()
+        out = dict(row)
+        try:
+            out["bytes"] = os.path.getsize(self.path) if self.path != ":memory:" else 0
+        except OSError:
+            out["bytes"] = 0
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Hub: live state, history store and connected browsers
 # ---------------------------------------------------------------------------
 
 class Hub:
-    def __init__(self, path, mode, quiet=False):
+    def __init__(self, store, mode, quiet=False):
         self.lock = threading.Lock()
+        self.store = store
+        self.mode = mode
+        self.quiet = quiet
         self.parser = Parser()
-        self.events = []
+        self.sid = None
+        self.announced = None
         self.raw = collections.deque(maxlen=RAW_KEEP)
         self.clients = set()
-        self.quiet = quiet
-        self.meta = {"path": str(path), "mode": mode, "waiting": False,
-                     "last_read": 0, "history_done": False, "tool": __version__}
+        self.source = None
+        self.importer = None
+        self.meta = {"path": None, "mode": mode, "waiting": False, "needs_setup": False, "last_read": 0,
+                     "history_done": False, "tool": __version__, "import": None, "sid": None}
 
+    # -- browsers ---------------------------------------------------------------
     def snapshot(self):
-        return {"t": "snapshot", "events": self.events[-SNAPSHOT_EVENTS:],
-                "raw": list(self.raw), "state": dict(self.parser.state), "meta": dict(self.meta)}
+        return {"t": "snapshot", "raw": list(self.raw), "state": dict(self.parser.state), "meta": dict(self.meta)}
 
     def subscribe(self):
         q = queue.Queue(maxsize=3000)
@@ -1019,23 +1176,72 @@ class Hub:
         for q in list(self.clients):
             self._send(q, msg)
 
-    def set_meta(self, **kw):
+    def broadcast(self, msg):
+        with self.lock:
+            self._broadcast(msg)
+
+    def set_meta(self, src=None, **kw):
+        if not self._mine(src):
+            return
         with self.lock:
             if any(self.meta.get(k) != v for k, v in kw.items()):
                 self.meta.update(kw)
                 self._broadcast({"t": "meta", "meta": dict(self.meta)})
 
-    def reset(self, note):
+    def sessions_changed(self):
+        self.broadcast({"t": "sessions"})
+
+    # -- sources ------------------------------------------------------------------
+    def _mine(self, src):
+        """Ignore stragglers from a tailer that was replaced by switch_log()."""
+        return src is None or src is self.source
+
+    def switch_log(self, path, remember=True):
+        path = Path(path)
+        with self.lock:
+            old_src, old_imp = self.source, self.importer
+            self.source = self.importer = None
+        for t in (old_src, old_imp):
+            if t:
+                t.stop()
         with self.lock:
             self.parser = Parser()
-            self.events = []
             self.raw.clear()
-            self._broadcast({"t": "reset", "note": note, "state": dict(self.parser.state)})
+            self.sid = self.announced = None
+            self.meta.update(path=str(path), needs_setup=False, waiting=False, history_done=False, sid=None)
+            self.source = FileTailer(path, self)
+            self.importer = Importer(path.parent / "logbackups", self)
+            self._broadcast({"t": "reset", "note": None, "state": dict(self.parser.state), "meta": dict(self.meta)})
+        if remember:
+            save_config({**load_config(), "log": str(path)})
+        con(f"Game.log: {path}")
+        self.source.start()
+        self.importer.start()
+
+    def begin_session(self, sid, path, src=None):
+        if not self._mine(src):
+            return
+        self.store.begin_session(sid, path)
+        with self.lock:
+            self.sid = sid
+            self.meta["sid"] = sid
+
+    def reset(self, note, src=None):
+        if not self._mine(src):
+            return
+        with self.lock:
+            self.parser = Parser()
+            self.raw.clear()
+            self.sid = self.announced = None
+            self.meta["sid"] = None
+            self._broadcast({"t": "reset", "note": note, "state": dict(self.parser.state), "meta": dict(self.meta)})
         if not self.quiet:
             con(f"\n=== {note} ===\n", "96")
 
-    def feed(self, lines, history=False):
-        new_events, new_raw = [], []
+    def feed(self, lines, history=False, size=None, src=None):
+        if not self._mine(src):
+            return
+        parsed, new_raw = [], []
         with self.lock:
             for ln in lines:
                 evs = self.parser.feed(ln)
@@ -1049,34 +1255,48 @@ class Hub:
                     r["l"] = "w"
                 self.raw.append(r)
                 new_raw.append(r)
-                if evs:
-                    self.events.extend(evs)
-                    new_events.extend(evs)
-            if len(self.events) > EVENTS_KEEP:
-                del self.events[:len(self.events) - EVENTS_KEEP]
+                parsed.extend(evs)
+            sid, state = self.sid, dict(self.parser.state)
+        new = self.store.add_events(sid, parsed) if sid else []
+        if sid:
+            self.store.update_session(sid, state, size)
+        with self.lock:
             self.meta["last_read"] = int(time.time() * 1000)
             if not history:
-                self._broadcast({"t": "batch", "ev": new_events, "raw": new_raw,
-                                 "state": dict(self.parser.state), "lr": self.meta["last_read"]})
+                self._broadcast({"t": "batch", "ev": new, "raw": new_raw, "state": state,
+                                 "lr": self.meta["last_read"]})
+                if new and self.announced != sid:
+                    self.announced = sid
+                    self._broadcast({"t": "sessions"})
         if not history and not self.quiet:
-            for e in new_events:
+            for e in new:
                 print_event(e)
 
-    def history_done(self):
+    def history_done(self, src=None):
+        if not self._mine(src):
+            return
         with self.lock:
             self.meta["history_done"] = True
+            self.announced = self.sid
             snap = self.snapshot()
             for q in list(self.clients):
                 self._send(q, snap)
+                self._send(q, {"t": "sessions"})
             st = self.parser.state
-        if not self.quiet and self.meta["mode"] == "live":
+        if not self.quiet and self.mode == "live":
             con(f"Read the current session so far: {fmt_num(st['lines'])} lines, "
-                f"{fmt_num(st['events'])} events.", "90")
-            con("Now following live ...\n", "92")
+                f"{fmt_num(st['events'])} events. Now following live ...", "92")
+
+    def set_import(self, src=None, **info):
+        if src is not None and src is not self.importer:
+            return
+        with self.lock:
+            self.meta["import"] = info
+            self._broadcast({"t": "meta", "meta": dict(self.meta)})
 
 
 # ---------------------------------------------------------------------------
-# Sources: live tailer and replay
+# Sources: live tailer, history importer and replay
 # ---------------------------------------------------------------------------
 
 class FileTailer(threading.Thread):
@@ -1086,21 +1306,26 @@ class FileTailer(threading.Thread):
         super().__init__(name="tailer")
         self.path = Path(path)
         self.hub = hub
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
 
     def run(self):
-        pos, buf, head = 0, b"", b""
+        pos, buf, head, sid = 0, b"", b"", None
         catching_up = True
-        while True:
+        hub, wait = self.hub, self.stop_event.wait
+        while not self.stop_event.is_set():
             try:
                 size = os.path.getsize(self.path)
             except OSError:
-                self.hub.set_meta(waiting=True)
+                hub.set_meta(src=self, waiting=True)
                 if catching_up:
                     catching_up = False
-                    self.hub.history_done()
-                time.sleep(1.0)
+                    hub.history_done(src=self)
+                wait(1.0)
                 continue
-            self.hub.set_meta(waiting=False)
+            hub.set_meta(src=self, waiting=False)
             data = b""
             try:
                 # open and close on every poll (see module docstring)
@@ -1108,16 +1333,16 @@ class FileTailer(threading.Thread):
                     h = f.read(HEAD_BYTES)
                     n = min(len(h), len(head))
                     if pos and (size < pos or h[:n] != head[:n]):
-                        pos, buf, head = 0, b"", b""
+                        pos, buf, head, sid = 0, b"", b"", None
                         catching_up = False
-                        self.hub.reset("New game session detected (Game.log was recreated)")
+                        hub.reset("New game session detected (Game.log was recreated)", src=self)
                     if len(h) > len(head):
                         head = h
                     if size > pos:
                         f.seek(pos)
                         data = f.read(min(size - pos, READ_CHUNK))
             except OSError:
-                time.sleep(POLL_SECONDS)
+                wait(POLL_SECONDS)
                 continue
 
             if data:
@@ -1125,14 +1350,81 @@ class FileTailer(threading.Thread):
                 data = buf + data
                 parts = data.split(b"\n")
                 buf = parts.pop()
+                if parts and sid is None:
+                    sid = session_key(parts[0])
+                    hub.begin_session(sid, self.path, src=self)
                 lines = [p.decode("utf-8", "replace").rstrip("\r") for p in parts]
                 if lines:
-                    self.hub.feed(lines, history=catching_up)
+                    hub.feed(lines, history=catching_up, size=pos - len(buf), src=self)
             if catching_up and pos >= size:
                 catching_up = False
-                self.hub.history_done()
+                hub.history_done(src=self)
             if not data or not catching_up:
-                time.sleep(POLL_SECONDS)
+                wait(POLL_SECONDS)
+
+
+class Importer(threading.Thread):
+    """Imports the logs Star Citizen keeps in logbackups, so no session is missing."""
+    daemon = True
+
+    def __init__(self, folder, hub):
+        super().__init__(name="importer")
+        self.folder = Path(folder)
+        self.hub = hub
+        self.stop_event = threading.Event()
+
+    def stop(self):
+        self.stop_event.set()
+
+    def run(self):
+        time.sleep(0.3)                      # let the live tailer identify the current session first
+        try:
+            files = sorted(self.folder.glob("*.log"), key=lambda p: p.stat().st_mtime)
+        except OSError:
+            files = []
+        store, total, done, imported = self.hub.store, len(files), 0, 0
+        self.hub.set_import(src=self, running=bool(files), done=0, total=total, imported=0)
+        for f in files:
+            if self.stop_event.is_set():
+                return
+            done += 1
+            try:
+                size = f.stat().st_size
+            except OSError:
+                continue
+            line = first_line_of(f)
+            if not line:
+                continue
+            sid = session_key(line)
+            if sid == self.hub.sid:
+                continue
+            info = store.session(sid)
+            if info and info["parser"] == PARSER_VERSION and info["size"] == size:
+                continue
+            self.import_file(f, sid, size)
+            imported += 1
+            self.hub.set_import(src=self, running=True, done=done, total=total, imported=imported)
+            if imported % 15 == 0:
+                self.hub.sessions_changed()
+        self.hub.set_import(src=self, running=False, done=done, total=total, imported=imported)
+        if imported:
+            self.hub.sessions_changed()
+            con(f"History: imported {imported} session(s) from {self.folder}", "90")
+
+    def import_file(self, path, sid, size):
+        store = self.hub.store
+        store.begin_session(sid, path)
+        parser, batch = Parser(), []
+        with open(path, "rb") as fh:
+            for raw in fh:
+                if self.stop_event.is_set():
+                    return
+                batch.extend(parser.feed(raw.decode("utf-8", "replace").rstrip("\r\n")))
+                if len(batch) >= 2000:
+                    store.add_events(sid, batch)
+                    batch = []
+        store.add_events(sid, batch)
+        store.update_session(sid, parser.state, size)
 
 
 class ReplaySource(threading.Thread):
@@ -1145,6 +1437,8 @@ class ReplaySource(threading.Thread):
         self.speed = max(speed, 0.1)
 
     def run(self):
+        line = first_line_of(self.path) or str(self.path).encode()
+        self.hub.begin_session(session_key(line), self.path)
         self.hub.history_done()
         time.sleep(1.5)                      # give the browser time to connect
         last_dt, batch = None, []
@@ -1174,6 +1468,129 @@ class ReplaySource(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
+# Settings, file dialog and autostart
+# ---------------------------------------------------------------------------
+
+def load_config():
+    for path in (config_path(), app_dir() / "sc_log_tracker.json"):   # second one: v1.0 location
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def save_config(cfg):
+    path = config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def resolve_user_path(value):
+    """A Game.log path from a file path, a LIVE folder or a StarCitizen folder. None if it can't be one."""
+    if not value:
+        return None
+    p = Path(str(value).strip().strip('"'))
+    if p.is_file():
+        return p
+    if p.is_dir():
+        logs = logs_in_folder(p)
+        if logs:
+            return logs[0]
+        for ch in CHANNELS:
+            if (p / ch).is_dir():
+                return p / ch / "Game.log"
+        if (p / "Bin64").is_dir() or (p / "logbackups").is_dir() or (p / "Data.p4k").exists():
+            return p / "Game.log"
+        return None
+    if p.name.lower() == "game.log" and p.parent.is_dir():
+        return p                             # the game hasn't created it yet
+    return None
+
+
+_dialog_lock = threading.Lock()
+
+
+def browse_for_log(initial=None):
+    """Native file dialog (tkinter). Returns (path or None, error or None)."""
+    with _dialog_lock:
+        try:
+            import tkinter
+            from tkinter import filedialog
+            root = tkinter.Tk()
+        except Exception:  # noqa: BLE001 - no tkinter or no display
+            return None, "The file dialog isn't available here. Paste the path instead."
+        try:
+            root.withdraw()
+            root.attributes("-topmost", True)
+            root.update()
+            start = Path(initial).parent if initial else None
+            path = filedialog.askopenfilename(
+                parent=root, title="Select your Star Citizen Game.log",
+                initialdir=str(start) if start and start.is_dir() else None,
+                filetypes=[("Star Citizen log", "Game.log"), ("Log files", "*.log"), ("All files", "*.*")])
+        finally:
+            root.destroy()
+        return (str(Path(path)) if path else None), None
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME = APP_NAME
+
+
+def autostart_supported():
+    return os.name == "nt"
+
+
+def autostart_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --background'
+    exe = Path(sys.executable)
+    pythonw = exe.with_name("pythonw.exe")
+    return f'"{pythonw if pythonw.exists() else exe}" "{Path(__file__).resolve()}" --background'
+
+
+def get_autostart():
+    if not autostart_supported():
+        return None
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
+            return winreg.QueryValueEx(key, RUN_NAME)[0]
+    except OSError:
+        return None
+
+
+def set_autostart(enabled):
+    """Start with Windows (current user only) in the background."""
+    if not autostart_supported():
+        return False
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        if enabled:
+            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(key, RUN_NAME)
+            except FileNotFoundError:
+                pass
+    return bool(get_autostart())
+
+
+def refresh_autostart():
+    """Keep the autostart entry pointing at this copy of the app if it was moved or updated."""
+    try:
+        current = get_autostart()
+        if current and current != autostart_command():
+            set_autostart(True)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Web server
 # ---------------------------------------------------------------------------
 
@@ -1189,22 +1606,108 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
+    def _json(self, obj, code=200):
+        self._send(code, "application/json; charset=utf-8", json.dumps(obj, ensure_ascii=False).encode("utf-8"))
+
+    def _host_ok(self):
+        """Only answer requests addressed to this machine (blocks DNS-rebinding tricks)."""
+        port = self.server.server_address[1]
+        return (self.headers.get("Host") or "").lower() in (f"127.0.0.1:{port}", f"localhost:{port}")
+
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path in ("/", "/index.html"):
+        if not self._host_ok():
+            return self._send(403, "text/plain", b"forbidden")
+        url = urllib.parse.urlsplit(self.path)
+        qs = urllib.parse.parse_qs(url.query)
+        hub = self.hub
+        if url.path in ("/", "/index.html"):
             page = PAGE.replace("{{VERSION}}", __version__).replace("{{REPO}}", REPO_URL)
             return self._send(200, "text/html; charset=utf-8", page.encode("utf-8"))
-        if path == "/api/state":
-            with self.hub.lock:
-                body = json.dumps({"state": self.hub.parser.state, "meta": self.hub.meta},
-                                  ensure_ascii=False).encode("utf-8")
-            return self._send(200, "application/json; charset=utf-8", body)
-        if path == "/stream":
+        if url.path == "/stream":
             return self._stream()
+        if url.path == "/api/ping":
+            return self._json({"app": APP_NAME, "version": __version__})
+        if url.path == "/api/state":
+            with hub.lock:
+                return self._json({"state": dict(hub.parser.state), "meta": dict(hub.meta)})
+        if url.path == "/api/events":
+            frm = (qs.get("from") or [None])[0] or None
+            to = (qs.get("to") or [None])[0] or None
+            try:
+                limit = max(1, min(int((qs.get("limit") or [EVENTS_LIMIT])[0]), 100000))
+            except ValueError:
+                limit = EVENTS_LIMIT
+            events, total = hub.store.events(frm, to, limit)
+            return self._json({"events": events, "total": total, "limit": limit})
+        if url.path == "/api/sessions":
+            rows = hub.store.sessions()
+            for r in rows:
+                r["live"] = r["id"] == hub.sid and hub.mode == "live"
+            return self._json({"sessions": rows})
+        if url.path == "/api/config":
+            return self._json(self._config())
         self._send(404, "text/plain", b"not found")
+
+    def do_POST(self):
+        # The custom header can't be sent cross-site without a CORS preflight, which we never allow.
+        if not self._host_ok() or self.headers.get(CSRF_HEADER) != "1":
+            return self._send(403, "text/plain", b"forbidden")
+        try:
+            length = min(int(self.headers.get("Content-Length") or 0), 65536)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            body = {}
+        path, hub = urllib.parse.urlsplit(self.path).path, self.hub
+        if path == "/api/config":
+            if hub.mode != "live":
+                return self._json({"error": "Not available in replay mode."}, 400)
+            log = resolve_user_path(body.get("log"))
+            if not log:
+                return self._json({"error": "Couldn't find a Game.log there. Pick the Game.log file, "
+                                            "or your StarCitizen or LIVE folder."}, 400)
+            hub.switch_log(log)
+            return self._json({"ok": True, "log": str(log)})
+        if path == "/api/browse":
+            chosen, err = browse_for_log(hub.meta.get("path"))
+            if err:
+                return self._json({"error": err}, 501)
+            return self._json({"path": chosen} if chosen else {"cancelled": True})
+        if path == "/api/autostart":
+            if not autostart_supported():
+                return self._json({"error": "Only available on Windows."}, 400)
+            try:
+                return self._json({"ok": True, "enabled": set_autostart(bool(body.get("enabled")))})
+            except OSError as e:
+                return self._json({"error": f"Couldn't change the setting: {e}"}, 500)
+        if path == "/api/quit":
+            self._json({"ok": True})
+            con("Quit from the dashboard.", "90")
+            threading.Timer(0.3, lambda: os._exit(0)).start()
+            return
+        self._send(404, "text/plain", b"not found")
+
+    def _config(self):
+        hub = self.hub
+        detected = []
+        for p in find_game_logs():
+            try:
+                modified = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="minutes")
+            except OSError:
+                modified = None
+            detected.append({"path": str(p), "channel": p.parent.name, "modified": modified})
+        enabled = None
+        if autostart_supported():
+            try:
+                enabled = bool(get_autostart())
+            except OSError:
+                enabled = False
+        return {"log": hub.meta.get("path"), "mode": hub.mode, "detected": detected,
+                "autostart": {"supported": autostart_supported(), "enabled": enabled},
+                "data_dir": str(DATA_DIR), "history": hub.store.stats(), "version": __version__}
 
     def _stream(self):
         self.send_response(200)
@@ -1236,7 +1739,7 @@ class Handler(BaseHTTPRequestHandler):
 def start_server(hub, port):
     Handler.hub = hub
     last_err = None
-    for p in range(port, port + 15):
+    for p in range(port, port + PORT_RANGE):
         try:
             srv = ThreadingHTTPServer(("127.0.0.1", p), Handler)
             srv.daemon_threads = True
@@ -1244,6 +1747,19 @@ def start_server(hub, port):
         except OSError as e:
             last_err = e
     raise SystemExit(f"No free port found from {port} upwards: {last_err}")
+
+
+def find_running_instance(port):
+    """Port of an SC Log Tracker that is already running on this PC, or None."""
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for p in range(port, port + PORT_RANGE):
+        try:
+            with opener.open(f"http://127.0.0.1:{p}/api/ping", timeout=0.5) as r:
+                if json.loads(r.read()).get("app") == APP_NAME:
+                    return p
+        except Exception:  # noqa: BLE001 - nothing there, or something else
+            continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1271,6 +1787,34 @@ def print_event(e):
     label = CAT_LABEL.get(e["c"], e["c"]).ljust(8)
     detail = f" - {e['d']}" if e.get("d") else ""
     con(f"[{local_time(e['ts'])}] {label} {e['ti']}{detail}", CAT_ANSI.get(e["c"]))
+
+
+def setup_output():
+    """The Windows app has no console: write messages to tracker.log in the data folder instead."""
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        log = DATA_DIR / "tracker.log"
+        if log.exists() and log.stat().st_size > 1_000_000:
+            os.replace(log, DATA_DIR / "tracker.old.log")
+        f = open(log, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 - lives as long as the app
+    except OSError:
+        f = open(os.devnull, "w")  # noqa: SIM115
+    if sys.stdout is None:
+        sys.stdout = f
+    if sys.stderr is None:
+        sys.stderr = f
+
+
+def show_error(message):
+    con(message, "91")
+    if getattr(sys, "frozen", False) and os.name == "nt":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, str(message), APP_NAME, 0x10)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1328,51 +1872,21 @@ def find_game_logs():
     return [p for _, p in found]
 
 
-def load_config():
-    try:
-        return json.loads(config_path().read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-
-
-def save_config(cfg):
-    path = config_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
-    except OSError:
-        pass
-
-
 def resolve_log(arg):
+    """Game.log from the command line, the saved settings or auto-detection. None if not found."""
     if arg:
-        p = Path(arg.strip().strip('"'))
-        if p.is_dir():
-            logs = logs_in_folder(p)
-            if logs:
-                return logs[0]
-            return (p / "LIVE" / "Game.log") if (p / "LIVE").is_dir() else (p / "Game.log")
-        return p
+        return resolve_user_path(arg) or Path(arg.strip().strip('"'))
     cfg = load_config()
     if cfg.get("log") and Path(cfg["log"]).parent.is_dir():
         return Path(cfg["log"])
     logs = find_game_logs()
-    if logs:
-        return logs[0]
-    con("Could not find your Game.log automatically.", "93")
-    con("Paste the path to your StarCitizen folder, LIVE folder or Game.log")
-    con(r"(e.g. C:\Program Files\Roberts Space Industries\StarCitizen\LIVE):", "90")
-    try:
-        answer = input("> ").strip()
-    except EOFError:
-        answer = ""
-    if not answer:
-        raise SystemExit("No path given.")
-    return resolve_log(answer)
+    return logs[0] if logs else None
 
 
 def resolve_replay(arg, live_path):
     if arg.lower() in ("last", "latest"):
+        if not live_path:
+            raise SystemExit("Couldn't find your Game.log, so there is no logbackups folder to replay from.")
         folder = Path(live_path).parent / "logbackups"
         try:
             files = sorted(folder.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -1394,13 +1908,16 @@ def resolve_replay(arg, live_path):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         prog="sc_log_tracker",
-        description="Real-time viewer for the Star Citizen Game.log.",
+        description="Real-time viewer and history for the Star Citizen Game.log.",
         epilog=REPO_URL)
     ap.add_argument("log", nargs="?", help="Game.log, LIVE folder or StarCitizen folder")
+    ap.add_argument("--background", action="store_true",
+                    help="run without opening the browser and without console output (used for autostart)")
     ap.add_argument("--replay", metavar="FILE",
-                    help="replay an old log file ('last' = newest file in logbackups)")
+                    help="replay a log file, not saved to history ('last' = newest file in logbackups)")
     ap.add_argument("--speed", type=float, default=30.0, help="replay speed (default 30x)")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"web port (default {DEFAULT_PORT})")
+    ap.add_argument("--data-dir", metavar="DIR", help=f"where settings and history are stored (default {DATA_DIR})")
     ap.add_argument("--no-browser", action="store_true", help="don't open the browser automatically")
     ap.add_argument("--quiet", action="store_true", help="don't print events to the console")
     ap.add_argument("--no-color", action="store_true", help="plain console output")
@@ -1409,40 +1926,61 @@ def parse_args(argv=None):
 
 
 def run(args):
-    global USE_COLOR
-    if os.name == "nt":
+    global USE_COLOR, DATA_DIR
+    if args.data_dir:
+        DATA_DIR = Path(args.data_dir).expanduser()
+    interactive = bool(getattr(sys.stdout, "isatty", lambda: False)())
+    if os.name == "nt" and interactive:
         os.system("")                    # enable ANSI colours in the Windows console
     try:
         sys.stdout.reconfigure(errors="replace")
     except Exception:  # noqa: BLE001
         pass
-    USE_COLOR = not args.no_color
+    USE_COLOR = interactive and not args.no_color
+    quiet = args.quiet or args.background
+    open_browser = not (args.no_browser or args.background)
 
     con(f"{APP_NAME} {__version__}", "96")
+
+    if not args.replay:
+        running = find_running_instance(args.port)
+        if running:
+            url = f"http://127.0.0.1:{running}/"
+            con(f"Already running, opening {url}")
+            if open_browser:
+                webbrowser.open(url)
+            return
 
     replay_last = bool(args.replay) and args.replay.lower() in ("last", "latest")
     live_path = None if args.replay and not replay_last else resolve_log(args.log)
 
     if args.replay:
-        src_path = resolve_replay(args.replay, live_path or ".")
-        hub = Hub(src_path, "replay", args.quiet)
+        src_path = resolve_replay(args.replay, live_path)
+        hub = Hub(Store(":memory:"), "replay", quiet)
+        hub.meta["path"] = str(src_path)
         source = ReplaySource(src_path, hub, args.speed)
         con(f"Replay:   {src_path}  ({args.speed:g}x speed)")
     else:
-        save_config({"log": str(live_path)})
-        hub = Hub(live_path, "live", args.quiet)
-        source = FileTailer(live_path, hub)
-        con(f"Game.log: {live_path}")
-        if not live_path.exists():
-            con("The file doesn't exist yet. Waiting for Star Citizen to start ...", "93")
+        hub = Hub(Store(DATA_DIR / "history.db"), "live", quiet)
+        con(f"History:  {DATA_DIR / 'history.db'}")
 
     srv, port = start_server(hub, args.port)
     url = f"http://127.0.0.1:{port}/"
-    con(f"Viewer:   {url}", "92")
-    con("Press Ctrl+C to quit.\n", "90")
     threading.Thread(target=srv.serve_forever, name="http", daemon=True).start()
-    source.start()
-    if not args.no_browser:
+    if args.replay:
+        source.start()
+    elif live_path:
+        hub.switch_log(live_path, remember=bool(args.log) or not load_config().get("log"))
+        if not live_path.exists():
+            con("The Game.log doesn't exist yet. Waiting for Star Citizen to start ...", "93")
+    else:
+        hub.set_meta(needs_setup=True)
+        con("Couldn't find your Game.log. Choose it in the dashboard.", "93")
+    if not args.replay:
+        refresh_autostart()
+    con(f"Viewer:   {url}", "92")
+    con("Press Ctrl+C or use Settings > Quit in the dashboard to stop.\n", "90")
+    if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
         while True:
@@ -1453,18 +1991,16 @@ def run(args):
 
 
 def main(argv=None):
+    setup_output()
     args = parse_args(argv)
     try:
         run(args)
     except SystemExit as e:
-        # keep the window open when started by double-click (.exe), so the message can be read
-        if e.code not in (None, 0) and getattr(sys, "frozen", False):
-            print(e.code if isinstance(e.code, str) else "")
-            try:
-                input("Press Enter to close ...")
-            except EOFError:
-                pass
-            sys.exit(1)
+        if e.code not in (None, 0):
+            show_error(e.code if isinstance(e.code, str) else f"Exited with code {e.code}")
+        raise
+    except Exception as e:
+        show_error(f"{APP_NAME} stopped because of an error:\n{type(e).__name__}: {e}")
         raise
 
 
@@ -1487,6 +2023,7 @@ PAGE = r"""<!doctype html>
   --c-session:#8d9bb5;--c-travel:#3cc8f2;--c-ship:#7f9dff;--c-mission:#f2c94c;--c-economy:#4fd18b;
   --c-combat:#ff6464;--c-law:#ff9a3d;--c-social:#c792ea;--c-notice:#9aa8bd;--c-error:#ff3d63;
   --mono:"Cascadia Mono","Consolas","SFMono-Regular",monospace;
+  color-scheme:dark;
 }
 *{box-sizing:border-box}
 html,body{margin:0;height:100%;background:var(--bg);color:var(--text);
@@ -1509,15 +2046,28 @@ header{display:flex;align-items:center;gap:16px;padding:10px 16px;border-bottom:
 .who span{white-space:nowrap}
 .who b{color:var(--text);font-weight:600}
 .who .k{color:var(--muted)}
-.path{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);overflow:hidden;white-space:nowrap;max-width:34vw}
+.path{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint);overflow:hidden;white-space:nowrap;
+  max-width:30vw;background:none;border:0;cursor:pointer;padding:0}
+.path:hover{color:var(--muted)}
 .btn{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:5px 11px;cursor:pointer;
   font-size:12px;white-space:nowrap}
 .btn:hover{border-color:var(--accent)}
 .btn.on{border-color:var(--accent);color:var(--accent)}
-main{flex:1;display:grid;grid-template-columns:310px 1fr;min-height:0}
-aside{border-right:1px solid var(--line);overflow:auto;padding:14px;display:flex;flex-direction:column;gap:16px}
-h2{margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--muted)}
-.now{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:4px 12px}
+.btn.primary{background:#0f2a38;border-color:#1f6680;color:#bfeeff}
+.btn.danger{border-color:#5a2230;color:#ff9aa8}
+.btn.danger.armed{background:#3a1018;border-color:var(--c-error);color:#fff}
+.btn:disabled{opacity:.5;cursor:default}
+.banner{display:none;align-items:center;gap:12px;padding:7px 16px;font-size:12.5px;border-bottom:1px solid var(--line);background:#0a1626;color:var(--muted)}
+.banner.show{display:flex}
+.bar{flex:0 0 160px;height:5px;border-radius:3px;background:var(--line);overflow:hidden}
+.bar i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+main{flex:1;display:grid;grid-template-columns:320px 1fr;min-height:0}
+aside{border-right:1px solid var(--line);overflow:auto;padding:14px;display:flex;flex-direction:column;gap:18px}
+h2{margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);
+  display:flex;justify-content:space-between;align-items:baseline}
+h2 small{font-size:11px;letter-spacing:0;text-transform:none;font-weight:400;color:var(--faint)}
+.box{background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.now{padding:4px 12px}
 .now .r{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid var(--line2)}
 .now .r:last-child{border-bottom:0}
 .now .k{font-size:12px;color:var(--muted);white-space:nowrap}
@@ -1527,19 +2077,32 @@ h2{margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.14em;text-trans
 .pill.safe{color:var(--good);border-color:rgba(111,224,160,.4)}
 .pill.risk{color:var(--warn);border-color:rgba(255,194,102,.4)}
 .pill.danger{color:var(--bad);border-color:rgba(255,128,128,.4)}
-.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.tile{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;min-width:0}
-.tile .v{font-size:21px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}
-.tile .k{font-size:11px;color:var(--muted);margin-top:2px}
-.tile .s{font-size:11px;color:var(--faint);margin-top:2px}
-.tile.wide{grid-column:1/-1}
+.range{padding:10px 12px;display:flex;flex-direction:column;gap:10px}
+.presets{display:flex;flex-wrap:wrap;gap:5px}
+.preset{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer;color:var(--muted)}
+.preset:hover{border-color:var(--accent)}
+.preset.on{border-color:var(--accent);color:var(--accent);background:#0c2030}
+.fld{display:grid;grid-template-columns:38px 1fr;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.fld input{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12.5px;width:100%;outline:0;min-width:0}
+.fld input:focus{border-color:var(--accent)}
+.hint{font-size:11.5px;color:var(--faint)}
+.sessions{max-height:340px;overflow:auto}
+.ses{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;border-bottom:1px solid var(--line2);cursor:pointer}
+.ses:last-child{border-bottom:0}
+.ses:hover{background:#0a1220}
+.ses.on{background:#0c2030;box-shadow:inset 3px 0 0 var(--accent)}
+.ses .a{font-size:12.5px;font-weight:600}
+.ses .b{font-size:11.5px;color:var(--faint)}
+.ses .c{font-size:11.5px;color:var(--muted);text-align:right;white-space:nowrap}
+.badge{font-size:10px;font-weight:700;letter-spacing:.08em;color:#06120c;background:var(--good);border-radius:4px;padding:0 5px;margin-left:6px}
 .note{font-size:11.5px;color:var(--faint);line-height:1.5;margin:0}
 .foot{font-size:11px;color:var(--faint);margin-top:auto}
 section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
-.tabs{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line)}
+.tabs{display:flex;gap:2px;padding:0 12px;border-bottom:1px solid var(--line);align-items:center}
 .tab{background:none;border:0;border-bottom:2px solid transparent;padding:10px 12px;cursor:pointer;color:var(--muted);font-weight:600}
 .tab.on{color:var(--text);border-bottom-color:var(--accent)}
 .tab .n{font-weight:400;color:var(--faint);margin-left:4px;font-variant-numeric:tabular-nums}
+.rangelabel{margin-left:auto;font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:9px 12px;border-bottom:1px solid var(--line)}
 .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);
   color:var(--faint);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;user-select:none}
@@ -1550,6 +2113,8 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 .search{margin-left:auto;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 10px;width:220px;outline:0}
 .search:focus{border-color:var(--accent)}
 .list{flex:1;overflow:auto;min-height:0}
+.day{position:sticky;top:0;z-index:1;padding:6px 14px;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
+  color:var(--muted);background:#08101b;border-bottom:1px solid var(--line)}
 .ev{display:grid;grid-template-columns:70px 86px minmax(0,1fr);gap:12px;padding:7px 14px;border-bottom:1px solid var(--line2);cursor:pointer}
 .ev:hover{background:#0a1220}
 .ev .t{font-family:var(--mono);font-size:12px;color:var(--muted);padding-top:1px}
@@ -1563,6 +2128,7 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 .ev.open .raw{display:block}
 .ev.fresh{animation:fresh 3s ease-out}
 @keyframes fresh{from{background:rgba(60,200,242,.16)}to{background:transparent}}
+.more{padding:14px;text-align:center;font-size:12px;color:var(--faint)}
 .rawlist{font-family:var(--mono);font-size:12px;line-height:1.5;padding:4px 0}
 .rl{display:grid;grid-template-columns:64px minmax(0,1fr);padding:0 14px 0 11px;border-left:3px solid transparent;color:#8193ad}
 .rl .tx{white-space:pre-wrap;word-break:break-all}
@@ -1572,12 +2138,35 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
 .empty-msg{padding:40px 20px;text-align:center;color:var(--faint)}
 .toast{position:fixed;right:18px;bottom:18px;background:var(--panel2);border:1px solid var(--accent);border-radius:8px;
-  padding:10px 14px;font-size:13px;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none}
+  padding:10px 14px;font-size:13px;opacity:0;transform:translateY(8px);transition:.25s;pointer-events:none;z-index:30}
 .toast.show{opacity:1;transform:none}
+.modal{position:fixed;inset:0;background:rgba(2,5,10,.72);display:none;align-items:flex-start;justify-content:center;z-index:20;overflow:auto;padding:6vh 16px}
+.modal.show{display:flex}
+.dialog{width:min(640px,100%);background:var(--panel);border:1px solid var(--line);border-radius:12px;box-shadow:0 20px 60px rgba(0,0,0,.5)}
+.dialog header{border-radius:12px 12px 0 0;justify-content:space-between}
+.dialog h3{margin:0;font-size:15px}
+.dsec{padding:16px 18px;border-bottom:1px solid var(--line2);display:flex;flex-direction:column;gap:10px}
+.dsec:last-child{border-bottom:0}
+.dsec h4{margin:0;font-size:12px;letter-spacing:.12em;text-transform:uppercase;color:var(--muted)}
+.dsec p{margin:0;font-size:13px;color:var(--muted)}
+.row{display:flex;gap:8px;align-items:center}
+.row input[type=text]{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-family:var(--mono);font-size:12px;outline:0}
+.row input[type=text]:focus{border-color:var(--accent)}
+.found{display:flex;flex-direction:column;gap:6px}
+.found button{display:flex;justify-content:space-between;gap:10px;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;cursor:pointer}
+.found button:hover{border-color:var(--accent)}
+.found .p{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.found .m{font-size:11.5px;color:var(--faint);white-space:nowrap}
+.msg{font-size:12.5px;min-height:1em}
+.msg.err{color:var(--bad)} .msg.ok{color:var(--good)}
+.switch{display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:13px}
+.switch input{margin-top:3px;accent-color:var(--accent)}
+.stopped{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;flex-direction:column;gap:8px;z-index:40;color:var(--muted)}
+.stopped.show{display:flex}
 @media (max-width:860px){
   main{grid-template-columns:1fr;grid-template-rows:auto 1fr}
-  aside{border-right:0;border-bottom:1px solid var(--line);max-height:42vh}
-  .path,.who .opt{display:none}
+  aside{border-right:0;border-bottom:1px solid var(--line);max-height:46vh}
+  .path,.who .opt,.rangelabel{display:none}
   .search{width:100%;margin-left:0}
   .ev{grid-template-columns:62px minmax(0,1fr)} .ev .b{display:none} .ev .raw{grid-column:1/-1}
 }
@@ -1595,14 +2184,16 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
     <span class="opt"><span class="k">Channel</span> <b id="hChannel">–</b></span>
     <span class="opt"><span class="k">Version</span> <b id="hVersion">–</b></span>
   </div>
-  <div class="path" id="hPath"></div>
-  <button class="btn" id="btnExport" title="Save this session's events as JSON">Export</button>
+  <button class="path" id="hPath" title="Change the Game.log location"></button>
+  <button class="btn" id="btnExport" title="Save the events of the selected time range as JSON">Export</button>
+  <button class="btn" id="btnSettings">Settings</button>
 </header>
+<div class="banner" id="banner"><span id="bannerText"></span><span class="bar" id="bannerBar"><i></i></span></div>
 <main>
   <aside>
     <div>
       <h2>Now</h2>
-      <div class="now">
+      <div class="box now">
         <div class="r"><span class="k">Location</span><span class="v" id="nLoc"></span></div>
         <div class="r"><span class="k">Jurisdiction</span><span class="v" id="nJur"></span></div>
         <div class="r"><span class="k">Zone</span><span class="v" id="nZone"></span></div>
@@ -1612,16 +2203,33 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
       </div>
     </div>
     <div>
-      <h2>Session</h2>
-      <div class="stats" id="stats"></div>
+      <h2>Time range</h2>
+      <div class="box range">
+        <div class="presets" id="presets">
+          <button class="preset" data-p="session">This session</button>
+          <button class="preset" data-p="today">Today</button>
+          <button class="preset" data-p="24h">24 hours</button>
+          <button class="preset" data-p="7d">7 days</button>
+          <button class="preset" data-p="30d">30 days</button>
+          <button class="preset" data-p="all">All</button>
+        </div>
+        <label class="fld">From <input type="datetime-local" id="rFrom" step="60"></label>
+        <label class="fld">To <input type="datetime-local" id="rTo" step="60"></label>
+        <div class="hint" id="rHint">Leave "To" empty to keep following live.</div>
+      </div>
     </div>
-    <p class="note">Since the 2026 builds, kills, K/D and your aUEC balance are no longer written to the Game.log (they moved server-side). Deaths only show up in some cases, for example when your ship is destroyed.</p>
+    <div>
+      <h2>History <small id="sesCount"></small></h2>
+      <div class="box sessions" id="sessions"><div class="empty-msg">No sessions yet.</div></div>
+    </div>
+    <p class="note">Since the 2026 builds, kills, K/D and your aUEC balance are no longer written to the Game.log. Deaths only show up in some cases, for example when your ship is destroyed.</p>
     <p class="foot">SC Log Tracker {{VERSION}} · <a href="{{REPO}}" target="_blank" rel="noopener">GitHub</a></p>
   </aside>
   <section class="feed">
     <div class="tabs">
       <button class="tab on" data-tab="ev">Events<span class="n" id="cEv">0</span></button>
-      <button class="tab" data-tab="raw">Raw log<span class="n" id="cRaw">0</span></button>
+      <button class="tab" data-tab="raw" title="Raw lines of the current game session">Raw log<span class="n" id="cRaw">0</span></button>
+      <span class="rangelabel" id="rangeLabel"></span>
     </div>
     <div class="toolbar">
       <span id="chips" style="display:contents"></span>
@@ -1633,40 +2241,139 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
     <div class="list rawlist" id="rawList" style="display:none"></div>
   </section>
 </main>
+
+<div class="modal" id="settings" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+  <div class="dialog">
+    <header><h3 id="setTitle">Settings</h3><button class="btn" id="setClose">Close</button></header>
+    <div class="dsec">
+      <h4>Game.log</h4>
+      <p id="setIntro">Where Star Citizen writes its log. Pick the Game.log file, or your StarCitizen or LIVE folder.</p>
+      <div class="row"><input type="text" id="setPath" placeholder="C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log" spellcheck="false">
+        <button class="btn" id="setBrowse">Browse ...</button><button class="btn primary" id="setSave">Use this</button></div>
+      <div class="msg" id="setMsg"></div>
+      <div class="found" id="setFound"></div>
+    </div>
+    <div class="dsec" id="setAutoSec">
+      <h4>Start with Windows</h4>
+      <label class="switch"><input type="checkbox" id="setAuto"><span>Start SC Log Tracker in the background when you sign in to Windows. It runs without a window and keeps your history up to date while you play. Open the dashboard any time by starting the app again.</span></label>
+      <div class="msg" id="autoMsg"></div>
+    </div>
+    <div class="dsec">
+      <h4>History</h4>
+      <p id="setHistory">–</p>
+      <p class="hint">Missed sessions are filled in from Star Citizen's own logbackups folder every time the tracker starts, so it doesn't need to run while you play.</p>
+    </div>
+    <div class="dsec">
+      <h4>Tracker</h4>
+      <div class="row"><button class="btn danger" id="btnQuit">Quit SC Log Tracker</button><span class="hint" id="quitHint">Stops the tracker. Start the app again to reopen it.</span></div>
+    </div>
+  </div>
+</div>
+<div class="stopped" id="stopped"><b>SC Log Tracker has stopped.</b><span>You can close this tab.</span></div>
 <div class="toast" id="toast"></div>
 <script>
 const CATS={session:"Session",travel:"Travel",ship:"Ship",mission:"Mission",economy:"Trade",
   combat:"Combat",law:"Law",social:"Party",notice:"Notice",error:"Error"};
-const MAX_RAW=4000, MAX_EV_DOM=2500;
-let events=[], raw=[], state={}, meta={};
+const MAX_RAW=4000, PAGE_SIZE=400;
+let events=[], total=0, limit=0, raw=[], state={}, meta={}, sessions=[];
 let active=new Set(Object.keys(CATS)), query="", tab="ev", onlyHits=false, autoScroll=true;
-let connected=false, lastLineAt=0;
+let connected=false, lastLineAt=0, shownList=[], rendered=0, loadSeq=0, lastImportRunning=false, stopped=false;
+let range=loadRange();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const num=n=>Number(n||0).toLocaleString("en-US",{maximumFractionDigits:0});
+const pad=n=>String(n).padStart(2,"0");
+function api(path,body){ const o={headers:{"X-SC-Log-Tracker":"1","Content-Type":"application/json"}};
+  if(body!==undefined){ o.method="POST"; o.body=JSON.stringify(body); } return fetch(path,o).then(r=>r.json().catch(()=>({error:"HTTP "+r.status}))); }
 function tLocal(ts){ if(!ts) return "--:--:--"; const d=new Date(ts); return isNaN(d)?ts.slice(11,19):d.toLocaleTimeString("en-GB",{hour12:false}); }
+function dayKey(ts){ const d=new Date(ts); return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate()); }
+function dayLabel(ts){ const d=new Date(ts), t=new Date(); const k=dayKey(ts);
+  if(k===dayKey(t)) return "Today"; const y=new Date(t); y.setDate(t.getDate()-1); if(k===dayKey(y)) return "Yesterday";
+  return d.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short",year:"numeric"}); }
+function shortDT(ts){ const d=new Date(ts); return d.toLocaleDateString("en-GB",{day:"numeric",month:"short"})+" "+pad(d.getHours())+":"+pad(d.getMinutes()); }
+function toInput(iso){ if(!iso) return ""; const d=new Date(iso); return d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate())+"T"+pad(d.getHours())+":"+pad(d.getMinutes()); }
+function fromInput(v){ if(!v) return null; const d=new Date(v); return isNaN(d)?null:d.toISOString(); }
+function dur(a,b){ if(!a||!b) return "–"; let s=Math.max(0,(new Date(b)-new Date(a))/1000|0); const h=s/3600|0; const m=(s%3600)/60|0; return h?`${h}h ${pad(m)}m`:`${m}m`; }
 function hl(s){ s=esc(s); if(!query) return s; const q=esc(query).replace(/[.*+?^${}()|[\]\\]/g,"\\$&"); return s.replace(new RegExp(q,"gi"),m=>"<mark>"+m+"</mark>"); }
 function matches(e){ if(!active.has(e.c)) return false; if(!query) return true;
   const q=query.toLowerCase(); return (e.ti+" "+e.d+" "+CATS[e.c]).toLowerCase().includes(q) || (e.raw||"").toLowerCase().includes(q); }
+function loadRange(){ try{ const r=JSON.parse(localStorage.getItem("sclt.range")||"null"); if(r&&r.preset) return r; }catch(e){} return {preset:"24h"}; }
+function saveRange(){ try{ localStorage.setItem("sclt.range",JSON.stringify(range)); }catch(e){} }
+function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),4000); }
+
+/* ---------- time range ---------- */
+function bounds(){
+  const now=Date.now(), iso=ms=>new Date(ms).toISOString();
+  switch(range.preset){
+    case "session": return {from:state.first_ts||iso(now), to:null};
+    case "today": { const d=new Date(); d.setHours(0,0,0,0); return {from:d.toISOString(), to:null}; }
+    case "24h": return {from:iso(now-864e5), to:null};
+    case "7d": return {from:iso(now-7*864e5), to:null};
+    case "30d": return {from:iso(now-30*864e5), to:null};
+    case "all": return {from:null, to:null};
+    default: return {from:range.from||null, to:range.to||null};
+  }
+}
+function renderRange(){
+  document.querySelectorAll(".preset").forEach(b=>b.classList.toggle("on",b.dataset.p===range.preset));
+  const b=bounds();
+  if(document.activeElement!==$("rFrom")) $("rFrom").value=toInput(b.from);
+  if(document.activeElement!==$("rTo")) $("rTo").value=toInput(b.to);
+  const live=!b.to;
+  $("rHint").textContent = live ? "Following live. Set \"To\" to look at a fixed period." : "Fixed period. Clear \"To\" to follow live again.";
+  const lbl = range.preset==="all" ? "All time" : (b.from?shortDT(b.from):"Start")+" – "+(b.to?shortDT(b.to):"now");
+  $("rangeLabel").textContent = lbl + (live?" · live":"");
+  document.querySelectorAll(".ses").forEach(el=>el.classList.toggle("on",el.dataset.id===range.sid));
+}
+function setRange(r){ range=r; saveRange(); renderRange(); loadEvents(); }
+$("presets").addEventListener("click",e=>{ const b=e.target.closest(".preset"); if(b) setRange({preset:b.dataset.p}); });
+function customChanged(){ const f=fromInput($("rFrom").value), t=fromInput($("rTo").value); setRange({preset:"custom",from:f,to:t}); }
+$("rFrom").addEventListener("change",customChanged); $("rTo").addEventListener("change",customChanged);
+
+function loadEvents(){
+  const b=bounds(), seq=++loadSeq; const qs=new URLSearchParams();
+  if(b.from) qs.set("from",b.from); if(b.to) qs.set("to",b.to);
+  api("/api/events?"+qs).then(res=>{ if(seq!==loadSeq||res.error) return;
+    events=res.events||[]; total=res.total||0; limit=res.limit||0; renderChips(); renderEvents(); updateCounts(); });
+}
+function inRange(e){ const b=bounds(); if(b.to) return false; return !b.from || (e.ts && e.ts>=b.from); }
 
 /* ---------- events ---------- */
 function evHtml(e,fresh){
-  return `<div class="ev ${e.lv}${fresh?" fresh":""}" style="--cc:var(--c-${e.c})" data-id="${e.id}">
+  return `<div class="ev ${e.lv}${fresh?" fresh":""}" style="--cc:var(--c-${e.c})">
     <span class="t">${tLocal(e.ts)}</span><span class="b">${CATS[e.c]||e.c}</span>
     <div><span class="ti">${hl(e.ti)}</span>${e.d?`<span class="d">${hl(e.d)}</span>`:""}</div>
     <div class="raw">Line ${e.n}: ${hl(e.raw)}</div></div>`;
 }
+const dayHtml=ts=>`<div class="day" data-day="${dayKey(ts)}">${dayLabel(ts)}</div>`;
 function renderEvents(){
-  const list=$("evList"); const shown=[];
-  for(let i=events.length-1;i>=0 && shown.length<MAX_EV_DOM;i--) if(matches(events[i])) shown.push(events[i]);
-  list.innerHTML = shown.length ? shown.map(e=>evHtml(e,false)).join("")
-    : `<div class="empty-msg">${events.length?"No events match this filter.":"No events yet. As soon as Star Citizen writes something to the log, it shows up here."}</div>`;
+  const list=$("evList"); shownList=events.filter(matches).reverse(); rendered=0; list.innerHTML="";
+  if(!shownList.length){ list.innerHTML=`<div class="empty-msg">${events.length?"No events match this filter.":(meta.import&&meta.import.running?"Importing your history ...":"No events in this time range.")}</div>`; return; }
+  renderMore(); list.scrollTop=0;
 }
+function renderMore(){
+  const list=$("evList"); const old=list.querySelector(".more"); if(old) old.remove();
+  const chunk=shownList.slice(rendered,rendered+PAGE_SIZE);
+  let last=rendered?dayKey(shownList[rendered-1].ts):null, html="";
+  for(const e of chunk){ const k=dayKey(e.ts); if(k!==last){ html+=dayHtml(e.ts); last=k; } html+=evHtml(e,false); }
+  rendered+=chunk.length;
+  if(rendered<shownList.length) html+=`<div class="more">Scroll for more ...</div>`;
+  else if(total>events.length) html+=`<div class="more">Showing the newest ${num(events.length)} of ${num(total)} events. Narrow the time range to see older ones.</div>`;
+  list.insertAdjacentHTML("beforeend",html);
+}
+$("evList").addEventListener("scroll",()=>{ const l=$("evList"); if(rendered<shownList.length && l.scrollTop+l.clientHeight>l.scrollHeight-700) renderMore(); });
 function addEvents(evs){
-  const list=$("evList"); const ok=evs.filter(matches); if(!ok.length) return;
-  const em=list.querySelector(".empty-msg"); if(em) em.remove();
-  list.insertAdjacentHTML("afterbegin", ok.reverse().map(e=>evHtml(e,true)).join(""));
-  while(list.children.length>MAX_EV_DOM) list.lastElementChild.remove();
+  const fresh=evs.filter(inRange); if(!fresh.length) return;
+  events.push(...fresh); total+=fresh.length;
+  const list=$("evList"); const ok=fresh.filter(matches);
+  if(ok.length){ const em=list.querySelector(".empty-msg"); if(em) em.remove(); }
+  for(const e of ok){
+    shownList.unshift(e); rendered++;
+    const top=list.firstElementChild, k=dayKey(e.ts);
+    if(top && top.classList.contains("day") && top.dataset.day===k) top.insertAdjacentHTML("afterend",evHtml(e,true));
+    else list.insertAdjacentHTML("afterbegin",dayHtml(e.ts)+evHtml(e,true));
+  }
+  renderChips(); updateCounts();
 }
 $("evList").addEventListener("click",ev=>{ const row=ev.target.closest(".ev"); if(row && !window.getSelection().toString()) row.classList.toggle("open"); });
 
@@ -1675,7 +2382,7 @@ function rawOk(r){ if(onlyHits && !r.k) return false; return !query || r.s.toLow
 function rawHtml(r){ return `<div class="rl${r.k?" hit":""}${r.l?" "+r.l:""}"${r.k?` style="--cc:var(--c-${r.k})"`:""}><span class="ln">${r.n}</span><span class="tx">${hl(r.s)}</span></div>`; }
 function renderRaw(){
   const list=$("rawList"); const ok=raw.filter(rawOk);
-  list.innerHTML = ok.length ? ok.map(rawHtml).join("") : `<div class="empty-msg">No lines.</div>`;
+  list.innerHTML = ok.length ? ok.map(rawHtml).join("") : `<div class="empty-msg">No lines from the current game session yet.</div>`;
   if(autoScroll) list.scrollTop=list.scrollHeight;
 }
 function addRaw(rs){
@@ -1692,7 +2399,7 @@ $("rawList").addEventListener("scroll",()=>{ const l=$("rawList"); const atEnd=l
 function renderChips(){
   const counts={}; for(const e of events) counts[e.c]=(counts[e.c]||0)+1;
   $("chips").innerHTML = tab!=="ev" ? "" : Object.entries(CATS).map(([k,l])=>
-    `<span class="chip${active.has(k)?" on":""}" data-c="${k}" style="--cc:var(--c-${k})" title="Click: show/hide · Double-click: only this"><span class="sw"></span>${l}<span class="cnt">${counts[k]||0}</span></span>`).join("");
+    `<span class="chip${active.has(k)?" on":""}" data-c="${k}" style="--cc:var(--c-${k})" title="Click: show/hide · Double-click: only this"><span class="sw"></span>${l}<span class="cnt">${num(counts[k]||0)}</span></span>`).join("");
 }
 let chipTimer=null;
 $("chips").addEventListener("click",ev=>{ const c=ev.target.closest(".chip"); if(!c) return;
@@ -1703,16 +2410,31 @@ document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{
   tab=b.dataset.tab; document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b));
   $("evList").style.display=tab==="ev"?"":"none"; $("rawList").style.display=tab==="raw"?"":"none";
   $("btnHits").style.display=$("btnScroll").style.display=tab==="raw"?"":"none";
-  renderChips(); if(tab==="raw"){ renderRaw(); } }));
+  renderChips(); if(tab==="raw") renderRaw(); }));
 let searchTimer=null;
 $("search").addEventListener("input",e=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{ query=e.target.value.trim(); renderEvents(); if(tab==="raw") renderRaw(); },150); });
 $("btnHits").addEventListener("click",()=>{ onlyHits=!onlyHits; $("btnHits").classList.toggle("on",onlyHits); renderRaw(); });
 $("btnScroll").addEventListener("click",()=>{ autoScroll=!autoScroll; $("btnScroll").classList.toggle("on",autoScroll); if(autoScroll){ const l=$("rawList"); l.scrollTop=l.scrollHeight; } });
+function updateCounts(){ $("cEv").textContent=num(total); $("cRaw").textContent=num(state.lines); }
 
-/* ---------- state ---------- */
+/* ---------- sessions ---------- */
+function loadSessions(){ api("/api/sessions").then(res=>{ sessions=res.sessions||[]; renderSessions(); }); }
+function renderSessions(){
+  $("sesCount").textContent = sessions.length ? num(sessions.length)+" sessions" : "";
+  $("sessions").innerHTML = sessions.length ? sessions.map(s=>{
+    const d=new Date(s.first_ts);
+    return `<div class="ses" data-id="${s.id}" title="${esc(s.path||"")}"><div><div class="a">${d.toLocaleDateString("en-GB",{weekday:"short",day:"numeric",month:"short",year:"numeric"})}${s.live?'<span class="badge">LIVE</span>':""}</div>
+      <div class="b">${pad(d.getHours())}:${pad(d.getMinutes())} – ${s.live?"now":tLocal(s.last_ts).slice(0,5)} · ${dur(s.first_ts,s.last_ts)}</div></div>
+      <div class="c">${num(s.events)} events${s.version?`<div class="b">${esc(s.version)}</div>`:""}</div></div>`; }).join("")
+    : `<div class="empty-msg">${meta.import&&meta.import.running?"Importing ...":"No sessions yet."}</div>`;
+  renderRange();
+}
+$("sessions").addEventListener("click",e=>{ const el=e.target.closest(".ses"); if(!el) return;
+  const s=sessions.find(x=>x.id===el.dataset.id); if(!s) return;
+  setRange({preset:"custom",from:s.first_ts,to:s.live?null:s.last_ts,sid:s.id}); });
+
+/* ---------- now panel and status ---------- */
 function setNow(id,val,html){ const el=$(id); if(val){ el.innerHTML=html??esc(val); el.classList.remove("empty"); } else { el.textContent="–"; el.classList.add("empty"); } }
-function dur(a,b){ if(!a||!b) return "–"; let s=Math.max(0,(new Date(b)-new Date(a))/1000|0); const h=s/3600|0; s%=3600; const m=s/60|0; s%=60;
-  return (h?h+"h ":"")+String(m).padStart(h?2:1,"0")+"m "+String(s).padStart(2,"0")+"s"; }
 function renderState(){
   const s=state;
   $("hHandle").textContent=s.handle||"–"; $("hChannel").textContent=s.channel||"–"; $("hVersion").textContent=s.version||"–";
@@ -1726,50 +2448,85 @@ function renderState(){
   const ship=s.ship||s.pilot_ship;
   setNow("nShip",ship, ship? esc(ship)+(s.ship_owner&&s.ship_owner!==s.handle?`<div class="note">owned by ${esc(s.ship_owner)}</div>`:"") : null);
   setNow("nQt",s.qt_target); setNow("nShard",s.shard);
-  const tiles=[
-    ["Session time",dur(s.first_ts,s.last_ts),`${num(s.lines)} log lines read`,"wide"],
-    ["Quantum jumps",num(s.qt_jumps),`targets set: ${num(s.qt_selected)}`],
-    ["Contracts done",num(s.contracts_done),`${num(s.contracts_acc)} accepted · ${num(s.contracts_failed)} failed`],
-    ["Objectives done",num(s.objectives_done),`missions ended: ${num(s.missions_ended)}`],
-    ["Deaths",num(s.deaths),`injuries: ${num(s.injuries)}`],
-    ["Purchases",num(s.purchases),`${num(s.spend)} aUEC spent`+(s.received?` · ${num(s.received)} received`:"")],
-    ["Blueprints",num(s.blueprints),""],
-    ["Offences",num(s.crimes),s.fines?`${num(s.fines)} UEC in fines`:""],
-    ["HUD notices",num(s.notifs),""],
-    ["Problems",num((s.crashes||0)+(s.net_errors||0)+(s.disconnects||0)),`${num(s.crashes)} crashes · ${num(s.disconnects)} to menu · ${num(s.net_errors)} network`,"wide"],
-  ];
-  if(s.kills) tiles.splice(4,0,["Kills (legacy)",num(s.kills),""]);
-  $("stats").innerHTML=tiles.map(([k,v,sub,cls])=>`<div class="tile ${cls||""}"><div class="v">${v}</div><div class="k">${k}</div>${sub?`<div class="s">${sub}</div>`:""}</div>`).join("");
-  $("cEv").textContent=num(events.length); $("cRaw").textContent=num(s.lines);
+  updateCounts();
 }
 function renderMeta(){
-  const p=meta.path||""; $("hPath").textContent=p.length>64?"…"+p.slice(-63):p; $("hPath").title=p;
-  document.title = (meta.mode==="replay"?"Replay · ":"")+"SC Log Tracker";
+  const p=meta.path||(meta.needs_setup?"Choose your Game.log ...":""); $("hPath").textContent=p.length>60?"…"+p.slice(-59):p; $("hPath").title=(meta.path||"")+"\nClick to change";
+  document.title=(meta.mode==="replay"?"Replay · ":"")+"SC Log Tracker";
+  $("btnSettings").style.display=meta.mode==="replay"?"none":"";
+  const im=meta.import, ban=$("banner");
+  if(im && im.running){ ban.classList.add("show"); $("bannerText").textContent=`Importing your history from Star Citizen's log backups: ${num(im.done)} of ${num(im.total)} logs ...`;
+    $("bannerBar").firstElementChild.style.width=(im.total?Math.round(100*im.done/im.total):0)+"%"; $("bannerBar").style.display=""; }
+  else if(meta.needs_setup){ ban.classList.add("show"); $("bannerText").textContent="Couldn't find your Game.log automatically. Open Settings to choose it."; $("bannerBar").style.display="none"; }
+  else ban.classList.remove("show");
+  if(lastImportRunning && !(im&&im.running)){ if(im&&im.imported) toast(`History updated: ${num(im.imported)} session(s) imported`); loadEvents(); loadSessions(); }
+  lastImportRunning=!!(im&&im.running);
+  if(meta.needs_setup && !$("settings").classList.contains("show") && !renderMeta.prompted){ renderMeta.prompted=true; openSettings(); }
   renderStatus();
 }
 function renderStatus(){
   const dot=$("dot"), txt=$("statusText");
+  if(stopped) return;
   if(!connected){ dot.className="dot off"; txt.textContent="Tracker not reachable"; return; }
   const ago=(Date.now()-lastLineAt)/1000;
-  if(meta.waiting){ dot.className="dot idle"; txt.textContent="Waiting for Game.log"; }
+  if(meta.needs_setup){ dot.className="dot idle"; txt.textContent="Game.log not set"; }
+  else if(meta.waiting){ dot.className="dot idle"; txt.textContent="Waiting for Star Citizen"; }
   else if(meta.mode==="replay"){ dot.className=meta.replay_done?"dot idle":"dot live"; txt.textContent=meta.replay_done?"Replay finished":"Replay running"; }
-  else if(lastLineAt && ago<90){ dot.className="dot live"; txt.textContent="Live"; }
-  else { dot.className="dot idle"; txt.textContent=lastLineAt?`Quiet for ${ago<3600?Math.round(ago/60)+" min":Math.round(ago/3600)+" h"}`:"Live, no lines yet"; }
+  else {
+    // judge by the log's own clock: a fresh line means the game is running right now
+    const logAgo = state.last_ts ? (Date.now()-new Date(state.last_ts))/1000 : Infinity;
+    if(lastLineAt && ago<90 && logAgo<180){ dot.className="dot live"; txt.textContent="Live"; }
+    else if(state.last_ts){ dot.className="dot idle"; txt.textContent="Game not running · last activity "+shortDT(state.last_ts); }
+    else { dot.className="dot idle"; txt.textContent="Waiting for Star Citizen"; }
+  }
 }
 setInterval(renderStatus,5000);
 
+/* ---------- settings ---------- */
+function openSettings(){ $("settings").classList.add("show"); $("setMsg").textContent=""; $("autoMsg").textContent="";
+  $("setIntro").textContent = meta.needs_setup ? "Couldn't find your Game.log automatically. Pick the Game.log file, or your StarCitizen or LIVE folder." : "Where Star Citizen writes its log. Pick the Game.log file, or your StarCitizen or LIVE folder.";
+  api("/api/config").then(c=>{
+    $("setPath").value=c.log||"";
+    $("setFound").innerHTML=(c.detected||[]).length ? "<p class='hint'>Found on this PC:</p>"+c.detected.map(d=>`<button data-path="${esc(d.path)}"><span class="p">${esc(d.path)}</span><span class="m">${esc(d.channel)}${d.modified?" · "+esc(d.modified.replace("T"," ")):""}</span></button>`).join("") : "";
+    $("setAutoSec").style.display=c.autostart&&c.autostart.supported?"":"none"; $("setAuto").checked=!!(c.autostart&&c.autostart.enabled);
+    const h=c.history||{}; $("setHistory").textContent=`${num(h.sessions)} sessions · ${num(h.events)} events`+(h.oldest?` since ${new Date(h.oldest).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`:"")+` · stored in ${c.data_dir}`;
+  });
+}
+function closeSettings(){ $("settings").classList.remove("show"); const q=$("btnQuit"); q.classList.remove("armed"); q.textContent="Quit SC Log Tracker"; }
+$("btnSettings").addEventListener("click",openSettings); $("hPath").addEventListener("click",()=>{ if(meta.mode!=="replay") openSettings(); });
+$("setClose").addEventListener("click",closeSettings);
+$("settings").addEventListener("click",e=>{ if(e.target.id==="settings") closeSettings(); });
+document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeSettings(); });
+$("setFound").addEventListener("click",e=>{ const b=e.target.closest("button"); if(b){ $("setPath").value=b.dataset.path; saveLog(); } });
+function msg(id,text,cls){ const m=$(id); m.textContent=text; m.className="msg "+(cls||""); }
+function saveLog(){ const v=$("setPath").value.trim(); if(!v){ msg("setMsg","Enter a path first.","err"); return; }
+  $("setSave").disabled=true; msg("setMsg","Checking ...");
+  api("/api/config",{log:v}).then(r=>{ $("setSave").disabled=false;
+    if(r.error){ msg("setMsg",r.error,"err"); return; }
+    $("setPath").value=r.log; msg("setMsg","Saved. Now following "+r.log,"ok"); toast("Game.log set"); loadEvents(); loadSessions(); }); }
+$("setSave").addEventListener("click",saveLog);
+$("setPath").addEventListener("keydown",e=>{ if(e.key==="Enter") saveLog(); });
+$("setBrowse").addEventListener("click",()=>{ $("setBrowse").disabled=true; msg("setMsg","A file dialog opened. If you don't see it, check your taskbar.");
+  api("/api/browse",{}).then(r=>{ $("setBrowse").disabled=false;
+    if(r.error) msg("setMsg",r.error,"err"); else if(r.path){ $("setPath").value=r.path; saveLog(); } else msg("setMsg",""); }); });
+$("setAuto").addEventListener("change",e=>{ const want=e.target.checked; msg("autoMsg","Saving ...");
+  api("/api/autostart",{enabled:want}).then(r=>{ if(r.error){ e.target.checked=!want; msg("autoMsg",r.error,"err"); return; }
+    e.target.checked=r.enabled; msg("autoMsg", r.enabled?"SC Log Tracker will start with Windows.":"Autostart turned off.","ok"); }); });
+$("btnQuit").addEventListener("click",()=>{ const q=$("btnQuit");
+  if(!q.classList.contains("armed")){ q.classList.add("armed"); q.textContent="Click again to quit"; setTimeout(()=>{ q.classList.remove("armed"); q.textContent="Quit SC Log Tracker"; },4000); return; }
+  stopped=true; api("/api/quit",{}).finally(()=>{ closeSettings(); $("stopped").classList.add("show"); }); });
+
 /* ---------- connection ---------- */
-function renderAll(){ renderMeta(); renderState(); renderChips(); renderEvents(); if(tab==="raw") renderRaw(); }
-function toast(msg){ const t=$("toast"); t.textContent=msg; t.classList.add("show"); clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove("show"),4000); }
 function handle(m){
-  if(m.t==="snapshot"){ events=m.events; raw=m.raw; state=m.state; meta=m.meta; lastLineAt=meta.last_read||0; renderAll(); }
+  if(m.t==="snapshot"){ raw=m.raw; state=m.state; meta=m.meta; lastLineAt=meta.last_read||0;
+    renderMeta(); renderState(); renderRange(); if(tab==="raw") renderRaw(); loadEvents(); loadSessions(); }
   else if(m.t==="batch"){
     if(m.raw.length){ raw.push(...m.raw); if(raw.length>MAX_RAW) raw.splice(0,raw.length-MAX_RAW); addRaw(m.raw); lastLineAt=Date.now(); }
-    if(m.ev.length){ events.push(...m.ev); addEvents(m.ev); renderChips(); }
-    state=m.state; renderState(); renderStatus();
+    state=m.state; renderState(); if(m.ev.length) addEvents(m.ev); renderStatus();
   }
-  else if(m.t==="reset"){ events=[]; raw=[]; state=m.state||{}; renderAll(); toast(m.note||"New session"); }
+  else if(m.t==="reset"){ raw=[]; state=m.state||{}; if(m.meta) meta=m.meta; renderMeta(); renderState(); if(tab==="raw") renderRaw(); if(m.note) toast(m.note); loadSessions(); }
   else if(m.t==="meta"){ meta=m.meta; renderMeta(); }
+  else if(m.t==="sessions"){ loadSessions(); }
 }
 function connect(){
   const es=new EventSource("/stream");
@@ -1778,11 +2535,13 @@ function connect(){
   es.onerror=()=>{ connected=false; renderStatus(); };
 }
 $("btnExport").addEventListener("click",()=>{
-  const blob=new Blob([JSON.stringify({exported:new Date().toISOString(),tool:"SC Log Tracker {{VERSION}}",state,events},null,1)],{type:"application/json"});
+  const b=bounds();
+  const blob=new Blob([JSON.stringify({exported:new Date().toISOString(),tool:"SC Log Tracker {{VERSION}}",range:b,total,events},null,1)],{type:"application/json"});
   const a=document.createElement("a"); const d=new Date();
-  a.download=`sc_session_${d.toISOString().slice(0,16).replace(/[:T]/g,"-")}.json`; a.href=URL.createObjectURL(blob); a.click();
+  a.download=`sc_events_${d.toISOString().slice(0,16).replace(/[:T]/g,"-")}.json`; a.href=URL.createObjectURL(blob); a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
 });
+renderRange();
 connect();
 </script>
 </body>
