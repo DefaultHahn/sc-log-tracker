@@ -81,3 +81,14 @@ def test_pretty_shop():
 def test_clean_notif_strips_language_pack_markup():
     raw = "Contract Shared: Tactical Strike Group Needed <EM4>[300 Rep] [BP]</EM4>: "
     assert t.clean_notif(raw) == "Contract Shared: Tactical Strike Group Needed"
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("PU_Human_Enemy_GroundCombat_NPC_ASD_soldier_6491691127623", "ASD soldier"),
+    ("NPC_Archetypes-Male-Human-FrontierFighter_6491691127623", "Frontier Fighter"),
+    ("Kopion_Irradiated_6491691127623", "Kopion Irradiated"),
+    ("SomePlayer", "SomePlayer"),
+    ("Wingman_Alpha", "Wingman_Alpha"),
+])
+def test_pretty_actor(name, expected):
+    assert t.pretty_actor(name) == expected

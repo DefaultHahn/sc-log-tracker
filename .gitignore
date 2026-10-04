@@ -30,3 +30,9 @@ logbackups/
 Thumbs.db
 .vscode/
 .idea/
+
+# Local history created when running from the repo with --data-dir .
+history.db*
+settings.json
+tracker*.log
+devdata/

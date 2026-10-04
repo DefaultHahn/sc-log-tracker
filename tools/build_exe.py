@@ -3,7 +3,8 @@
     pip install pyinstaller
     python tools/build_exe.py
 
-Creates dist/SC-Log-Tracker.exe. Used by the release workflow, works locally too.
+Creates dist/SC-Log-Tracker.exe (no console window; it opens the dashboard in the browser).
+Used by the release workflow, works locally too.
 """
 import re
 import subprocess
@@ -47,7 +48,7 @@ def main():
     version = read_version()
     build = ROOT / "build"
     build.mkdir(exist_ok=True)
-    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--console",
+    cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed",
            "--name", NAME, "--icon", str(ROOT / "assets" / "icon.ico"),
            "--distpath", str(ROOT / "dist"), "--workpath", str(build), "--specpath", str(build)]
     if sys.platform == "win32":

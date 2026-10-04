@@ -51,7 +51,12 @@ jobs:
         run: python tools/build_exe.py
 
       - name: Smoke test exe
-        run: ./dist/SC-Log-Tracker.exe --version
+        run: |
+          ./dist/SC-Log-Tracker.exe --version
+          ./dist/SC-Log-Tracker.exe --replay examples/demo_game.log --no-browser --port 8790 --data-dir "$RUNNER_TEMP/sclt" &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8790/api/ping > /dev/null && break; sleep 1; done
+          curl -sf http://127.0.0.1:8790/api/ping | grep -q "SC Log Tracker"
+          curl -sf -X POST -H "X-SC-Log-Tracker: 1" -H "Content-Type: application/json" -d '{}' http://127.0.0.1:8790/api/quit
 
       - name: Package
         run: |

@@ -5,6 +5,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-05
+
+### Added
+- **Complete history:** every session is stored in a local SQLite archive (`%LOCALAPPDATA%\SC Log Tracker`). On every start the tracker imports new logs from Star Citizen's `logbackups` folder, so sessions played without the tracker are filled in. Sessions are re-imported automatically when a newer version parses them differently.
+- **Time range filter** with date and time ("From"/"To"), quick picks (this session, today, 24 hours, 7 days, 30 days, all) and a **history list** of all sessions. The feed shows day headers and loads more as you scroll.
+- **Settings:** choose the `Game.log` with a file dialog, from the installations found on the PC, or by pasting a path. The settings open by themselves when no `Game.log` is found.
+- **Start with Windows** option (runs in the background).
+- **Quit** button in the dashboard, and a single instance: starting the app again opens the running dashboard.
+- `--background` and `--data-dir` options.
+- Recognition of more notifications: objective failed, contract withdrawn, left party, invitation declined, bricking of whole ships.
+- Readable names for NPCs in kill events from older patches.
+
+### Changed
+- The Windows app no longer opens a console window. Messages go to `tracker.log` in the data folder.
+- The status shows whether the game is actually running, based on the log's own timestamps.
+- Hotfix builds show their real version (e.g. `4.7.0-hotfix`) instead of `1.0.x`.
+- Legacy logs (4.1 to 4.3) only show kills and vehicle losses that involve you, and no longer list repeated insurance claims.
+- POST requests to the local server now require a custom header, and requests for other host names are refused.
+
+### Removed
+- The session statistics panel (replaced by the time range and history).
+- The console prompt for the `Game.log` path (replaced by the settings dialog).
+
 ## [1.0.0] - 2026-10-04
 
 First public release.
@@ -21,5 +44,6 @@ First public release.
 - Replay of old sessions (`--replay`), JSON export, automatic `Game.log` discovery, new-session detection.
 - Windows executable built by GitHub Actions for every release.
 
-[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/DefaultHahn/sc-log-tracker/releases/tag/v1.0.0

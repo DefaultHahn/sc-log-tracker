@@ -23,6 +23,8 @@ pip install pytest ruff
 pytest            # run the tests
 ruff check .      # lint
 python sc_log_tracker.py --replay examples/demo_game.log --speed 60
+# a throwaway history instead of your real one:
+python sc_log_tracker.py --data-dir ./devdata
 ```
 
 ## Adding a log pattern
@@ -32,6 +34,7 @@ Everything lives in [`sc_log_tracker.py`](sc_log_tracker.py):
 - **HUD notifications** (lines with `Added notification "...`) are handled in `Parser._notif`. The text arrives already cleaned and joined across lines, so you usually only need one `re.match`.
 - **All other lines** go through `Parser._other`. Check for a cheap substring first (`if "<SomeTag>" in line:`), then run the regex.
 - **Location codes** are translated in `pretty_loc` / `pretty_dest`. Only add a name to `STATIONS` if you've confirmed it in game.
+- **If a change makes the parser produce different events**, bump `PARSER_VERSION`. Everyone's history is then re-imported from the log files that still exist.
 
 Every new pattern needs a test in `tests/` with a real (anonymized) sample line. Keep event titles short and in sentence case, and put the details in the second field.
 
