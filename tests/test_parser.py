@@ -138,3 +138,31 @@ def test_legacy_kill_line():
     p, events = parse(lines)
     assert events[-1]["ti"] == "Kill"
     assert p.state["kills"] == 1
+
+
+def test_legacy_kills_of_others_are_hidden():
+    lines = [
+        "<2025-03-01T10:00:00.000Z> [Notice] <Legacy login response> [CIG-net] User Login Success - Handle[Me] - Time[1]",
+        "<2025-03-01T10:05:00.000Z> [Notice] <Actor Death> CActor::Kill: 'NPC_1' [1] in zone 'x' killed by 'NPC_2' [2] using 'KLWE_LaserRepeater_S3_1234' [Class KLWE_LaserRepeater_S3] with damage type 'Bullet' from direction x: 0",
+    ]
+    _, events = parse(lines)
+    assert titles(events) == ["Logged in"]
+
+
+def test_hotfix_version_comes_from_branch():
+    lines = [
+        "<2026-03-30T19:40:49.835Z> FileVersion: 1.0.176.11384",
+        "<2026-03-30T19:41:01.397Z> Branch: sc-alpha-4.7.0-hotfix",
+    ]
+    p, events = parse(lines)
+    assert p.state["version"] == "4.7.0-hotfix"
+    assert titles(events) == ["Game version"]
+
+
+def test_more_notifications():
+    def n(text, nid):
+        return f'<2026-10-03T20:00:{nid:02d}.000Z> [Notice] <SHUDEvent_OnNotification> Added notification "{text}: " [{nid}] to queue.'
+    _, events = parse([n("Objective Failed: Escort Ship to Hangar", 1), n("Contract Withdrawn: Reduce Overpopulation", 2),
+                       n("You have left the party.", 3),
+                       n("Item Bricked: Your RSI Polaris and 59 attached item(s) are now bricked and will no longer function.", 4)])
+    assert titles(events) == ["Objective failed", "Contract withdrawn", "Left party", "Item bricked"]

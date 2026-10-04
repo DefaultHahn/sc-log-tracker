@@ -51,7 +51,7 @@ PORT_RANGE = 15
 CHANNELS = ("LIVE", "PTU", "EPTU", "TECH-PREVIEW", "HOTFIX")
 # Bump when the parser produces different events, so stored history is re-imported
 # from every log file that still exists.
-PARSER_VERSION = 2
+PARSER_VERSION = 1
 
 POLL_SECONDS = 0.25
 READ_CHUNK = 4 * 1024 * 1024
@@ -359,6 +359,7 @@ CRASH_MARK = "public crash handler taking over"
 CRASH_EXC_RE = re.compile(r"Exception (\w+)\((0x[0-9A-Fa-f]+)\)")
 DISCO_RE = re.compile(r'cause=(\d+) reason="([^"]*)"')
 FULLVER_RE = re.compile(r"(?:File|Product)Version:\s*([\d.]+)")
+BRANCH_RE = re.compile(r"Branch:\s*sc-alpha-(\S+)")
 EXE_CHANNEL_RE = re.compile(r"[\\/](LIVE|PTU|EPTU|TECH-PREVIEW|HOTFIX)[\\/]Bin64", re.I)
 PU_JOIN = ("Context Establisher Done", 'gamerules="SC_Default"', 'establisher="Network"')
 
@@ -548,6 +549,12 @@ class Parser:
         if m:
             S["objectives_done"] += 1
             return ev("mission", "Objective complete", m.group(1), "good")
+        m = re.match(r"Objective Failed:\s*(.*)", t)
+        if m:
+            return ev("mission", "Objective failed", m.group(1), "bad")
+        m = re.match(r"Contract Withdrawn:\s*(.*)", t)
+        if m:
+            return ev("mission", "Contract withdrawn", m.group(1), "warn")
         m = re.match(r"Objective Withdrawn:\s*(.*)", t)
         if m:
             return ev("mission", "Objective withdrawn", m.group(1), "warn")
@@ -687,10 +694,10 @@ class Parser:
         if m:
             S["blueprints"] += 1
             return ev("economy", "Blueprint received", m.group(1), "good")
-        m = re.match(r"Item Bricking Initiated: Your (.+?)\s+is bricking", t)
+        m = re.match(r"Item Bricking Initiated: Your (.+?)\s+(?:is|are) bricking", t)
         if m:
             return ev("notice", "Item bricking", m.group(1), "warn")
-        m = re.match(r"Item Bricked: Your (.+?)\s+is now bricked", t)
+        m = re.match(r"Item Bricked: Your (.+?)\s+(?:is|are) now bricked", t)
         if m:
             return ev("notice", "Item bricked", m.group(1), "bad")
 
@@ -749,6 +756,11 @@ class Parser:
             return ev("social", "Party created")
         if re.match(r"You have joined party", t):
             return ev("social", "Joined party", "", "good")
+        if t.startswith("You have left the party"):
+            return ev("social", "Left party")
+        m = re.match(r"Invitation Declined (\S+) has declined", t)
+        if m:
+            return ev("social", "Invitation declined", m.group(1), "warn")
         if t.startswith("You have been kicked from the party"):
             return ev("social", "Kicked from party", "", "warn")
         if t.startswith("Party Disbanded"):
@@ -907,10 +919,6 @@ class Parser:
             if m and m.group(1) != "Success":
                 return ev("economy", "Purchase failed", m.group(1), "bad")
             return
-        if "New Insurance Claim Request" in line:
-            return ev("ship", "Insurance claim filed")
-        if "Claim Complete" in line and "CWallet" in line:
-            return ev("ship", "Insurance claim complete", "", "good")
 
         # --- crashes, connection, quitting ---
         if CRASH_MARK in line:
@@ -972,20 +980,28 @@ class Parser:
                 elif me and victim == me:
                     S["deaths"] += 1
                     ev("combat", "Killed", f"by {killer} with {wpn} ({dtype})", "bad")
-                else:
-                    ev("combat", "Kill", f"{killer} -> {victim} ({dtype})")
+                # deaths of everyone else nearby were logged too: too noisy to show
             return
         if "<Vehicle Destruction>" in line:
             m = VDESTROY_RE.search(line)
             if m:
                 veh, _zone, driver, _from, lvl_to, cause = m.groups()
-                what = "destroyed" if lvl_to == "2" else "disabled"
-                ev("combat", f"Vehicle {what}", f"{pretty_class(veh)} (pilot: {driver}, by {cause})",
-                   "bad" if driver == S["handle"] else "info")
+                me = S["handle"]
+                if me and me in (driver, cause):
+                    what = "destroyed" if lvl_to == "2" else "disabled"
+                    ev("combat", f"Vehicle {what}", f"{pretty_class(veh)} (pilot: {driver}, by {cause})",
+                       "bad" if driver == me else "good")
             return
 
         if S["version"] is None and ("FileVersion" in line or "ProductVersion" in line):
             m = FULLVER_RE.search(line)
+            if m:
+                S["version"] = m.group(1)
+                if not m.group(1).startswith("1.0."):  # hotfix builds report 1.0.x, see Branch below
+                    return ev("session", "Game version", m.group(1))
+                return
+        if "Branch: sc-alpha-" in line and (S["version"] is None or S["version"].startswith("1.0.")):
+            m = BRANCH_RE.search(line)
             if m:
                 S["version"] = m.group(1)
                 return ev("session", "Game version", m.group(1))
