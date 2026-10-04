@@ -1,0 +1,38 @@
+name: Missing or unrecognized event
+description: Something happened in game but the tracker didn't show it (or showed it as "HUD notice").
+labels: [log-pattern]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        These reports are the most useful way to keep the tracker up to date after a patch.
+        **Please remove personal information** from the log lines (handle, playerGEID, other players' names, IP addresses).
+  - type: textarea
+    id: ingame
+    attributes:
+      label: What happened in game?
+      placeholder: e.g. "I sold cargo at Area18" or "my ship got impounded"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Star Citizen version
+      placeholder: "4.10.193.11644"
+    validations:
+      required: true
+  - type: textarea
+    id: lines
+    attributes:
+      label: Matching log lines (anonymized)
+      description: Search the raw log tab or your Game.log for the moment it happened.
+      render: text
+    validations:
+      required: true
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed my handle, player ID, other players' names and IP addresses from the log lines.
+          required: true

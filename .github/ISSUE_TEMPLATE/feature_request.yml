@@ -1,0 +1,11 @@
+name: Feature request
+description: An idea to make the tracker more useful.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like?
+      description: Describe the feature and what you'd use it for.
+    validations:
+      required: true

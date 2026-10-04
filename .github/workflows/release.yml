@@ -1,0 +1,80 @@
+name: Release
+
+# Push a tag like v1.2.3 to build the Windows exe and publish a GitHub release.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check that the tag matches __version__
+        run: |
+          version=$(python -c "import sc_log_tracker as t; print(t.__version__)")
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install tools
+        run: pip install pytest pyinstaller
+
+      - name: Test
+        run: pytest -q
+
+      - name: Build exe
+        run: python tools/build_exe.py
+
+      - name: Smoke test exe
+        run: ./dist/SC-Log-Tracker.exe --version
+
+      - name: Package
+        run: |
+          mkdir -p out "pkg/SC-Log-Tracker-$VERSION/examples"
+          cp dist/SC-Log-Tracker.exe out/
+          cp sc_log_tracker.py start.bat README.md LICENSE CHANGELOG.md "pkg/SC-Log-Tracker-$VERSION/"
+          cp examples/demo_game.log "pkg/SC-Log-Tracker-$VERSION/examples/"
+          (cd pkg && 7z a -tzip "../out/SC-Log-Tracker-$VERSION-python.zip" "SC-Log-Tracker-$VERSION" > /dev/null)
+          (cd out && sha256sum SC-Log-Tracker.exe "SC-Log-Tracker-$VERSION-python.zip" > SHA256SUMS.txt)
+          cat out/SHA256SUMS.txt
+
+      - name: Release notes from CHANGELOG
+        run: |
+          python - <<'PY'
+          import os, re
+          version = os.environ["VERSION"]
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          m = re.search(rf"^## \[{re.escape(version)}\][^\n]*\n(.*?)(?=^## \[|^\[|\Z)", text, re.M | re.S)
+          notes = m.group(1).strip() if m else "See CHANGELOG.md."
+          notes += (
+              "\n\n## Download\n\n"
+              "- **SC-Log-Tracker.exe**: Windows, no Python needed. Download it and double-click it.\n"
+              f"- **SC-Log-Tracker-{version}-python.zip**: the Python version, run `start.bat` or `python sc_log_tracker.py`.\n\n"
+              "Windows SmartScreen may warn the first time because the exe isn't code-signed: "
+              "click **More info → Run anyway**. Checksums are in `SHA256SUMS.txt`.\n"
+          )
+          open("notes.md", "w", encoding="utf-8").write(notes)
+          PY
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" out/* \
+            --title "SC Log Tracker $VERSION" \
+            --notes-file notes.md

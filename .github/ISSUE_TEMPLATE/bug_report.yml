@@ -1,0 +1,49 @@
+name: Bug report
+description: Something doesn't work or shows the wrong thing.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! **Please remove personal information from any log lines** (your handle, playerGEID / player ID, other players' names, IP addresses).
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what did the tracker show instead?
+    validations:
+      required: true
+  - type: input
+    id: tracker
+    attributes:
+      label: Tracker version
+      description: Shown at the bottom left of the dashboard, or run with `--version`.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: game
+    attributes:
+      label: Star Citizen version
+      description: Shown in the dashboard header.
+      placeholder: "4.10.193.11644"
+  - type: dropdown
+    id: how
+    attributes:
+      label: How do you run it?
+      options:
+        - Windows exe
+        - Python
+  - type: textarea
+    id: lines
+    attributes:
+      label: Log lines (anonymized)
+      description: The relevant lines from your Game.log, if any.
+      render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed my handle, player ID, other players' names and IP addresses from the log lines.
+          required: true
