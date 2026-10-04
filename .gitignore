@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+
+# Build output
+build/
+dist/
+out/
+*.spec
+notes.md
+
+# Local settings written by the app
+sc_log_tracker.json
+
+# Never commit real game logs (they contain your handle and player ID)
+Game.log
+logbackups/
+*.log
+!examples/*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

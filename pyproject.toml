@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sc-log-tracker"
+dynamic = ["version"]
+description = "Real-time viewer for the Star Citizen Game.log: readable events, a live status panel and a searchable raw log in your browser."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.9"
+authors = [{ name = "DefaultHahn" }]
+keywords = ["star-citizen", "game-log", "log-viewer", "tracker"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Games/Entertainment",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DefaultHahn/sc-log-tracker"
+Issues = "https://github.com/DefaultHahn/sc-log-tracker/issues"
+
+[project.scripts]
+sc-log-tracker = "sc_log_tracker:main"
+
+[tool.setuptools]
+py-modules = ["sc_log_tracker"]
+
+[tool.setuptools.dynamic]
+version = { attr = "sc_log_tracker.__version__" }
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "I"]
+ignore = [
+    "E501",   # long regexes and HTML are clearer on one line
+    "B023",   # small closures in the parser are intentional
+    "UP015",
+]

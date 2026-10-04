@@ -1,0 +1,6 @@
+* text=auto
+*.bat text eol=crlf
+# keep the demo log byte-for-byte (CRLF like the real Game.log)
+*.log -text
+*.png binary
+*.ico binary
