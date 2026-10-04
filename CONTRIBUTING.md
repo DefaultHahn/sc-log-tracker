@@ -45,6 +45,7 @@ Every new pattern needs a test in `tests/` with a real (anonymized) sample line.
 
 1. Bump `__version__` in `sc_log_tracker.py`.
 2. Move the `[Unreleased]` notes in `CHANGELOG.md` to a new version heading.
-3. Commit, then tag and push: `git tag v1.2.3 && git push origin main v1.2.3`.
+3. Commit and push to `main`.
+4. On GitHub, open **Actions → Release → Run workflow** (or push a tag `v1.2.3` that matches the version).
 
-The [release workflow](.github/workflows/release.yml) runs the tests, builds `SC-Log-Tracker.exe`, and publishes a GitHub release with the changelog notes.
+The [release workflow](.github/workflows/release.yml) runs the tests, builds `SC-Log-Tracker.exe`, creates the `v1.2.3` tag and publishes a GitHub release with the changelog notes.

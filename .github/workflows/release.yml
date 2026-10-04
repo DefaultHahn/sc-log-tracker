@@ -1,7 +1,9 @@
 name: Release
 
-# Push a tag like v1.2.3 to build the Windows exe and publish a GitHub release.
+# Builds the Windows exe and publishes a GitHub release for the version in sc_log_tracker.py.
+# Start it with Actions > Release > "Run workflow", or by pushing a tag like v1.2.3.
 on:
+  workflow_dispatch:
   push:
     tags: ["v*.*.*"]
 
@@ -22,14 +24,22 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check that the tag matches __version__
+      - name: Read version
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=$(python -c "import sc_log_tracker as t; print(t.__version__)")
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+          tag="v$version"
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_NAME" != "$tag" ]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match __version__ $version"
             exit 1
           fi
+          if gh release view "$tag" > /dev/null 2>&1; then
+            echo "::error::Release $tag already exists. Bump __version__ in sc_log_tracker.py first."
+            exit 1
+          fi
           echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
 
       - name: Install tools
         run: pip install pytest pyinstaller
@@ -75,6 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" out/* \
+          gh release create "$TAG" out/* \
+            --target "$GITHUB_SHA" \
             --title "SC Log Tracker $VERSION" \
             --notes-file notes.md
