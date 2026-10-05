@@ -36,13 +36,14 @@ def test_events_and_sessions(running):
     some = json.loads(request(port, "/api/events?from=2026-10-03T18:10:00.000Z&to=2026-10-03T18:12:00.000Z")[1])
     assert 0 < some["total"] < data["total"]
     sessions = json.loads(request(port, "/api/sessions")[1])["sessions"]
-    assert len(sessions) == 2 and sum(s["live"] for s in sessions) == 1
+    assert len(sessions) == 2 and not any(s["live"] for s in sessions)   # the demo game isn't running now
 
 
 def test_config_get_and_set(running, tmp_path):
     hub, port, live = running
     cfg = json.loads(request(port, "/api/config")[1])
     assert cfg["log"].endswith("Game.log") and cfg["history"]["sessions"] == 2
+    assert cfg["default_log"].endswith("Game.log") and "autostart" not in cfg
     hdr = {t.CSRF_HEADER: "1"}
     code, body = request(port, "/api/config", {"log": str(tmp_path / "nowhere")}, hdr)
     assert code == 400 and "Couldn't find" in json.loads(body)["error"]
@@ -208,3 +209,22 @@ def test_reloading_the_dashboard_doesnt_quit(running, monkeypatch):
     tab = open_dashboard(port)                           # the reloaded page connects again
     assert not quit_called.wait(4)
     close_dashboard(tab)
+
+
+def test_recap_endpoint(running):
+    hub, port, _ = running
+    data = json.loads(request(port, "/api/recap")[1])
+    assert len(data["sessions"]) == 2 and not any(r["live"] for r in data["sessions"])
+    newest = data["sessions"][0]
+    assert [c["place"] for c in newest["chapters"]] == ["Orbituary", "Checkmate", "Ashgrove (Monox)"]
+    assert newest["summary"]["contracts"]["completed"] == 1
+    places = {p["place"]: p for p in data["places"]}
+    assert places["Orbituary"]["visits"] == 2 and places["Orbituary"]["sessions"] == 2
+    some = json.loads(request(port, "/api/recap?from=2026-10-03T18:00:00.000Z")[1])
+    assert len(some["sessions"]) == 1
+
+
+def test_old_autostart_entry_only_cleans_up():
+    # Versions before 1.4 started "--background" with Windows; now that just removes the entry.
+    assert t.main(["--background", "--port", "18990"]) is None
+    assert t.ping(18990) is None

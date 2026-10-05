@@ -176,3 +176,61 @@ def test_every_server_join_is_an_event():
     assert [e["x"] for e in events] == ["pub_euw1b_1_110", "pub_euw1b_1_110", "pub_use1b_1_250"]
     assert events[2]["d"] == "pub_use1b_1_250 · US East"
     assert p.state["region"] == "US East"
+
+
+PLACE = ("<2026-10-02T16:34:46.000Z> [Notice] <[ActorState] Place> [ACTOR STATE][CSCActorControlAdditiveStatePlace::DoPlace] "
+         "'{who}' [204] placed '{item}_851234567890' [851234567890] in lootable container '{box}_833462956612' [833462956612] "
+         "[Team_ActorFeatures][Actor]")
+
+
+def test_activities_from_placed_items():
+    me = '<2026-10-02T16:00:00.000Z> [Notice] <Legacy login response> [CIG-net] User Login Success - Handle[Me] - Time[1]'
+    lines = [me,
+             PLACE.format(who="Me", item="Fuse_subItem_standard", box="GPI_Relay_1slot_001_CZ_Degradation"),
+             PLACE.format(who="Me", item="Carryable_2H_FL_Rdt_Vlk_Egg", box="Stmgn_Pylon_Hatch"),
+             PLACE.format(who="Me", item="FPS_Consumable_KeyCard_SOO_WeaponCache", box="Slot_Removable_Chip_Access_SOO_WeaponCache"),
+             PLACE.format(who="Me", item="ORI_game_chess", box="game_chess_1_a-001"),            # nothing special
+             PLACE.format(who="Someone", item="Fuse_subItem_standard", box="GPI_Door_1slot")]    # not you
+    _, events = parse(lines)
+    acts = [(e["ti"], e["d"], e["x"]) for e in events if e["c"] == "activity"]
+    assert acts == [("Fuse inserted", "contested zone relay", "fuse"), ("Valakkar egg delivered", "", "egg"),
+                    ("Keycard used", "weapon cache", "keycard")]
+
+
+def test_mission_end_carries_the_contract_name():
+    mid = "c40dedbc-ab90-4d3c-98cc-ce9e91ab3d93"
+    lines = [
+        f'<2026-10-02T22:00:00.000Z> [Notice] <SHUDEvent_OnNotification> Added notification "Contract Accepted: Kill the king: " [5] to queue. New queue size: 1, MissionId: [{mid}], ObjectiveId: []',
+        f"<2026-10-02T22:30:00.000Z> [Notice] <EndMission> Ending mission for player. MissionId[{mid}] Player[Me] PlayerId[1] CompletionType[Fail] Reason[Mission Ended]",
+        "<2026-10-02T22:31:00.000Z> [Notice] <EndMission> Ending mission for player. MissionId[11111111-ab90-4d3c-98cc-ce9e91ab3d93] Player[Me] PlayerId[1] CompletionType[Abandon] Reason[Mission Ended]",
+    ]
+    _, events = parse(lines)
+    ended = [(e["d"], e["x"]) for e in events if e["ti"] == "Mission ended"]
+    assert ended == [("failed: Kill the king", "failed"), ("abandoned", "abandoned")]
+
+
+def test_location_and_purchase_carry_machine_readable_values():
+    lines = [
+        "<2026-10-02T16:00:00.000Z> [Notice] <RequestLocationInventory> Player[Me] requested inventory for Location[Pyro1_ASD_Monorail_LazarusTransportHub_Tithonus_2B] [Team]",
+        "<2026-10-02T16:10:00.000Z> [Notice] <RequestLocationInventory> Player[Me] requested inventory for Location[Nyx_Levski] [Team]",
+        "<2026-10-02T16:20:00.000Z> [Notice] <CEntityComponentShopUIProvider::SendShopBuyRequest> Sending SShopBuyRequest - playerId[1] shopId[2] shopName[SCShop_Levski_Electronics] kioskId[3] client_price[2550.000000] itemClassGUID[x] itemName[bltr_consumable_hackingchip] quantity[1]",
+    ]
+    _, events = parse(lines)
+    assert [(e["d"], e["x"]) for e in events if e["ti"] == "Location"] == [
+        ("Lazarus Transport Hub Tithonus 2B (Pyro I)", "Pyro"), ("Levski", "Nyx")]
+    assert [e["x"] for e in events if e["ti"] == "Purchase"] == ["2550"]
+
+
+def test_quantum_arrival_at_a_real_place_names_it():
+    sel = "<2026-10-03T17:35:19.316Z> [Notice] <Player Selected Quantum Target - Local> [ItemNavigation][CL][1] | NOT AUTH | ANVL_C8R_Pisces_855968667336[855968667336]|CSCItemNavigation::OnPlayerSelectedQuantumTarget|Player has selected point {} as their destination, routing locally"
+    arr = "<2026-10-03T17:36:27.847Z> [Notice] <Quantum Drive Arrived - Arrived at Final Destination> [ItemNavigation][CL][1] | NOT AUTH | ANVL_C8R_Pisces_855968667336[855968667336]|CSCItemNavigation::OnQuantumDriveArrived|Quantum Drive has arrived at final destination"
+    _, events = parse([sel.format("rs_ext_pyro2_l4"), arr, sel.format("PartyMemberMarker_781821676082"), arr])
+    assert [e.get("x") for e in events if e["ti"] == "Quantum jump arrived"] == ["Checkmate", None]
+
+
+def test_systems():
+    assert t.system_of_code("RR_P3_LEO") == "Pyro" and t.system_of_code("Nyx_Kaboos") == "Nyx"
+    assert t.system_of_code("RR_HUR_LEO") == "Stanton" and t.system_of_code("rr_jp_stantonpyro") == "Stanton"
+    assert t.system_of_code("rs_ext_pyro-stan_jp1") == "Pyro" and t.system_of_code("somewhere") is None
+    assert t.system_of_name("Orbituary") == "Pyro" and t.system_of_name("Attritus (Daymar)") == "Stanton"
+    assert t.system_of_name("Rest stop Terminus (orbit)") == "Pyro" and t.system_of_name("Nyx System") == "Nyx"

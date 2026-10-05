@@ -5,6 +5,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-05
+
+### Added
+- **Sessions tab:** every session as a list of stops: where you were, when, for about how long and what you did there (contracts, purchases with their total, ships flown or boarded, quantum jumps, activities, injuries and deaths, server changes, crashes). Each card starts with a summary: servers, ships, money spent, contracts, activities and who you played with. Click a stop to see its events.
+- **Places:** one row per place with stops, sessions, time, what you did there and your time per star system. Click a place to see the sessions with it; the search works here too.
+- **Activities** as a new event category: fuses (contested zones, doors, relays), hacking chips, keycards, ASD server blades and hard drives, Rockcracker crystals, Valakkar eggs and mining gadgets.
+- Mission outcomes now name the contract ("failed: Kill the king"), and places know their star system.
+
+### Changed
+- The settings show the standard `Game.log` path in grey under the field (click it to use it) instead of a list of installations.
+- The "LIVE" badge only shows while the game is actually running.
+- Your history is re-imported once from the logs that still exist, to pick up the new details (takes a few seconds).
+
+### Removed
+- The **Now** panel.
+- **Start with Windows.** It isn't needed: sessions are imported from Star Citizen's logs the next time you open the tracker. If you had turned it on, the entry is removed automatically.
+
 ## [1.3.0] - 2026-10-05
 
 ### Changed
@@ -70,7 +87,8 @@ First public release.
 - Replay of old sessions (`--replay`), JSON export, automatic `Game.log` discovery, new-session detection.
 - Windows executable built by GitHub Actions for every release.
 
-[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.1...v1.3.0
 [1.2.1]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.1.0...v1.2.0

@@ -13,19 +13,21 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 [![Windows](https://img.shields.io/badge/platform-Windows-0078d6)](#download)
 [![License: MIT](https://img.shields.io/github/license/DefaultHahn/sc-log-tracker)](LICENSE)
 
-<img src="docs/screenshot.png" alt="SC Log Tracker showing the live event feed, the current location, a time range filter and the session history" width="100%">
+<img src="docs/screenshot.png" alt="SC Log Tracker showing the live event feed, a time range filter and the session history" width="100%">
 
 </div>
 
 ## Features
 
 - **Live event feed:** quantum jumps, locations, jurisdictions, armistice zones, ships you board, contracts and objectives, purchases, blueprints, injuries, deaths, crimes, party activity, crashes and disconnects.
+- **Session recaps:** every session as a short story: where you were, for how long and what you did there. "Levski: flew the Golem, bought 6 hacking chips · Lazarus Tithonus 2B: delivered 3 Valakkar eggs, changed server 4×".
+- **Places:** every place you've been, how often, how long and what you did there, split by star system.
+- **Activities:** fuses and hacking chips in contested zones, keycards, server blades and hard drives in ASD facilities, Valakkar eggs, Rockcracker crystals and mining gadgets.
 - **Complete history:** every session is saved to a local archive. On every start the tracker also imports the logs Star Citizen keeps in `logbackups`, so sessions you played while it wasn't running are filled in, going back as far as those backups go.
 - **Server history:** every shard you joined, when and for how long, with its region (Europe, US East, Australia, Asia ...). See your time per region and per server, and click a visit to see what happened there.
 - **Time range filter:** look at this session, today, the last 7 or 30 days, everything, or any period you pick by date and time. Click a session in the history list to jump to it.
-- **"Now" panel:** where you are, which jurisdiction you're in, whether you're in an armistice or monitored zone, your ship, your quantum target and your server.
 - **Readable names:** internal codes like `RR_P3_LEO` or `Outpost_OLP_Stanton2b_Attritus` become `Orbituary` and `Attritus (Daymar)`.
-- **Runs quietly:** no console window, and it quits when you close the dashboard. Optional start with Windows, a single instance (starting the app again just opens the dashboard), and a newer version replaces an older one that is still running.
+- **Runs quietly:** no console window, and it quits when you close the dashboard. A single instance: starting the app again just opens the dashboard, and a newer version replaces an older one that is still running.
 - **Works with any install folder:** it finds your `Game.log` on its own, or you pick it in the settings.
 - **Raw log view, filters, search and JSON export.**
 - **Zero setup:** one file, no dependencies, works offline.
@@ -62,9 +64,9 @@ Or download the source zip from the [latest release](https://github.com/DefaultH
 
 The tracker looks for the `Game.log` in the RSI Launcher's log and in the usual install folders on all drives. If you installed Star Citizen somewhere else, or want to follow the PTU instead of LIVE, open **Settings** (or click the path in the top bar). There you can:
 
-- pick one of the installations it found,
 - click **Browse ...** to choose the `Game.log` with the normal Windows file dialog,
-- or paste the path to the `Game.log`, your `StarCitizen` folder or your `LIVE` folder.
+- paste the path to the `Game.log`, your `StarCitizen` folder or your `LIVE` folder,
+- or click the standard path shown in grey under the field to go back to it.
 
 If it can't find anything on the first start, the settings open by themselves. Your choice is remembered.
 
@@ -74,15 +76,23 @@ You don't need to keep the tracker running while you play: Star Citizen moves ev
 
 Use **Time range** on the left to choose what the event feed shows. Leave **To** empty to keep following live; set it to look at a fixed period. The **History** list shows every session with its date, length and number of events.
 
+### Sessions: where you were and what you did
+
+The **Sessions** tab tells each session in the selected time range as a list of stops: the place, when you got there, how long you stayed and what you did there, such as contracts accepted and completed, purchases with their total, ships you flew or boarded, fuses, keycards and Valakkar eggs, injuries and deaths, server changes and crashes. The top of each card sums it up: servers, ships, money spent, contracts, activities and who you played with. Click a card to open or close it, click a stop to see its events.
+
+Switch to **Places** for one row per place: how many stops, in how many sessions, about how much time and what you did there, plus your time per star system. Click a place to see the sessions you were there. The search box works in both, so typing `Lazarus` shows every session with a Lazarus stop.
+
+<img src="docs/screenshot-sessions.png" alt="Sessions tab: one card per session with its stops, time per stop and what happened there" width="100%">
+
+<img src="docs/screenshot-places.png" alt="Places tab: every place with stops, sessions, time and activities" width="100%">
+
+The game only logs when you arrive somewhere (opening the inventory, plotting a quantum route, a quantum jump), not when you leave, so the time per place is an estimate. A place the game reports for a moment right after a server change is counted as the place around it.
+
 ### Server history
 
 The **Servers** tab lists every server (shard) you were on in the selected time range, for example `pub_euw1b_12660092_110` in Europe. A visit lasts from joining a shard until you leave it, move to another one (e.g. through a party launch) or close the game. Rejoining the same shard within five minutes counts as the same visit. Switch to **By server** for one row per shard with your number of visits and total time, and see at the top how your time splits between regions. Click a visit to show its events.
 
 <img src="docs/screenshot-servers.png" alt="Servers tab: server visits with region, duration and time per region" width="100%">
-
-### Start with Windows
-
-Turn on **Settings → Start with Windows** to have the tracker start in the background when you sign in. That copy keeps running while the dashboard is closed, so your history fills up live while you play, and the dashboard is one double-click away. Quit it with **Settings → Quit SC Log Tracker**. Turn autostart off the same way. (This adds an entry for your user only, under *Settings → Apps → Startup* in Windows.)
 
 ### Where your data is stored
 
@@ -94,8 +104,6 @@ Settings and the history live in `%LOCALAPPDATA%\SC Log Tracker` (on other syste
 sc_log_tracker.py [path] [options]
 
   path                  Game.log, LIVE folder or StarCitizen folder (optional)
-  --background          no browser, no console output, keeps running when the dashboard
-                        is closed (used for "Start with Windows")
   --replay FILE         replay a log file without saving it ("last" = newest file in logbackups)
   --speed N             replay speed, default 30 (= 30x real time)
   --port N              web port, default 8777
@@ -115,11 +123,12 @@ The `.exe` takes the same options, e.g. `SC-Log-Tracker.exe --replay last`. To t
 | **Category chips** | Click to show or hide a category. Double-click to show only that one. |
 | **Event row** | Click to show the original log line. |
 | **History list** | Click a session to show just that session. |
+| **Sessions** | Click a card to open it, click a stop to see its events. **Places** lists every place. |
 | **Servers** | Click a visit to show its events. Search works here too, e.g. `use1` for US East. |
 | **Raw log** | The current game session's lines. Scroll up to pause auto-scroll. |
 | **Export** | Downloads the events of the selected time range as JSON. |
 
-<img src="docs/screenshot-settings.png" alt="Settings: choosing the Game.log, start with Windows, history and quit" width="100%">
+<img src="docs/screenshot-settings.png" alt="Settings: choosing the Game.log, history and quit" width="100%">
 
 ## Is this safe to use?
 
@@ -158,13 +167,13 @@ Open **Settings** and click **Browse ...**, or paste the path to your Star Citiz
 <details>
 <summary><b>How do I stop it?</b></summary>
 
-Close the dashboard tab: the tracker quits a few seconds later. **Settings → Quit SC Log Tracker** does the same right away. The copy started with Windows (if you turned that on) keeps running in the background until you quit it in the settings. In a terminal, Ctrl+C works too.
+Close the dashboard tab: the tracker quits a few seconds later. **Settings → Quit SC Log Tracker** does the same right away. In a terminal, Ctrl+C works too.
 </details>
 
 <details>
 <summary><b>Do I have to start it every time I play?</b></summary>
 
-No. Sessions you played without it are imported from Star Citizen's `logbackups` the next time you open it. Turn on **Start with Windows** if you want it to record live in the background while you play.
+No. Star Citizen keeps the logs of your sessions in `logbackups`, and the tracker imports everything new the next time you open it. Only the raw log view needs it to run while you play.
 </details>
 
 <details>

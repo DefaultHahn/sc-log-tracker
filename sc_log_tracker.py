@@ -7,7 +7,8 @@ keeps a complete history of all your sessions and shows everything in a local
 browser dashboard:
 
   * live event feed with date/time range filter and session history
-  * "Now" panel (location, jurisdiction, zone, ship, quantum target, server)
+  * session recaps: where you were and what you did there, plus all your places
+  * server history
   * automatic import of the logs Star Citizen keeps in logbackups
   * raw log view with search, filter and auto-scroll
 
@@ -16,7 +17,6 @@ Pure Python standard library, Python 3.9+.
 Usage:
     python sc_log_tracker.py                       find the Game.log automatically
     python sc_log_tracker.py "D:\\Games\\StarCitizen\\LIVE"
-    python sc_log_tracker.py --background          no browser, no window (autostart)
     python sc_log_tracker.py --replay old.log      replay a log file (not saved to history)
 
 Anti-cheat: the tool only reads the text files the game writes itself. No memory
@@ -41,19 +41,20 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 APP_NAME = "SC Log Tracker"
 REPO_URL = "https://github.com/DefaultHahn/sc-log-tracker"
 DEFAULT_PORT = 8777
 PORT_RANGE = 15
 CHANNELS = ("LIVE", "PTU", "EPTU", "TECH-PREVIEW", "HOTFIX")
+DEFAULT_LOG = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log"
 # Bump when the parser produces different events, so stored history is re-imported
 # from every log file that still exists.
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 
 POLL_SECONDS = 0.25
 QUIT_GRACE = 5           # seconds after the last dashboard tab closed before the app quits
@@ -274,6 +275,49 @@ def pretty_loc(s):
     return re.sub(r"\s+", " ", split_camel(t)).strip()
 
 
+STATION_SYSTEM = {"Everus Harbor": "Stanton", "Seraphim Station": "Stanton", "Baijini Point": "Stanton",
+                  "Port Tressler": "Stanton", "Grim HEX": "Stanton", "Lorville": "Stanton", "Area18": "Stanton",
+                  "Orison": "Stanton", "New Babbage": "Stanton", "Checkmate": "Pyro", "Orbituary": "Pyro",
+                  "Starlight Service Station": "Pyro", "Levski": "Nyx", "Kaboos": "Nyx"}
+SYSTEM_NAMES = {"Stanton", "Pyro", "Nyx", "Castra", "Magnus", "Terra"}
+
+
+def system_of_code(code):
+    """Star system of an internal location code: RR_P3_LEO -> Pyro, Nyx_Levski -> Nyx."""
+    low = (code or "").lower()
+    m = re.match(r"rr_jp_(stanton|pyro|nyx|castra|magnus|terra)", low) or \
+        re.match(r"rs_ext_(stan|stanton|pyro|nyx)\w*?-\w+?_jp", low)
+    if m:
+        return SYSTEMS[m.group(1)]
+    if low.startswith("nyx") or "levski" in low or "kaboos" in low:
+        return "Nyx"
+    if re.match(r"rr_p\d|rs_ext_pyro|pyro", low) or re.search(r"_pyro\d", low):
+        return "Pyro"
+    if re.match(r"rr_(hur|cru|arc|mic)|rs_ext_(hur|cru|arc|mic)|stanton|grimhex|lorville|area18|orison|newbabbage", low) \
+            or re.search(r"_stanton\d", low):
+        return "Stanton"
+    return None
+
+
+def system_of_name(name):
+    """Star system of a readable place name, as far as it can be told."""
+    if not name:
+        return None
+    if name in STATION_SYSTEM:
+        return STATION_SYSTEM[name]
+    m = re.fullmatch(r"(\w+) System", name)
+    if m and m.group(1) in SYSTEM_NAMES:
+        return m.group(1)
+    for body_code, body in BODIES.items():
+        if name == body or name.endswith(f"({body})") or name == f"Rest stop {body} (orbit)":
+            return "Pyro" if body_code.startswith("pyro") else "Stanton"
+    if re.match(r"PYR\d", name):
+        return "Pyro"
+    if re.match(r"(HUR|CRU|ARC|MIC)[- ]L\d", name):
+        return "Stanton"
+    return None
+
+
 def pretty_dest(s):
     """Readable quantum target. Returns (name, is_real_place)."""
     if not s:
@@ -383,6 +427,11 @@ DEAD_ACTOR_RE = re.compile(r"Actor '([^']+)'")
 DEAD_ZONE_RE = re.compile(r"ejected from zone '([^']+)'")
 DEAD_TO_RE = re.compile(r"to zone '([^']+)'")
 ENDMISSION_TYPE_RE = re.compile(r"CompletionType\[([^\]]+)\]")
+ENDMISSION_ID_RE = re.compile(r"MissionId\[([0-9a-fA-F-]{36})\]")
+NOTIF_MISSION_RE = re.compile(r"MissionId: \[([0-9a-fA-F-]{36})\]")
+NO_MISSION = "00000000-0000-0000-0000-000000000000"
+PLACE_RE = re.compile(r"StatePlace::DoPlace\] '([^']+)' \[\d+\] placed '([^']+?)(?:_\d{6,})?' \[\d+\] "
+                      r"(?:in lootable container|on entity) '([^']+)'")
 ITEMBUY_RE = re.compile(r"client_price\[([\d.]+)\].*?itemName\[([^\]]+)\] quantity\[(\d+)\]")
 COMMBUY_RE = re.compile(r"\bprice\[([\d.]+)\]")
 SHOPNAME_RE = re.compile(r"shopName\[([^\]]+)\]")
@@ -437,6 +486,39 @@ COMPLETION = {"complete": "completed", "completed": "completed", "fail": "failed
               "withdraw": "withdrawn", "withdrawn": "withdrawn"}
 
 
+KEYCARDS = {"weaponcache": "weapon cache", "securestorage": "secure storage", "bunkercard": "bunker",
+            "security": "security", "maintenance": "maintenance"}
+
+
+def classify_placement(item, container):
+    """What putting an item somewhere means: (kind, title, detail), or None if it's nothing special."""
+    it, ct = item.lower(), re.sub(r"([_-]\d{6,})+$", "", container.lower())
+    if it.startswith("fuse"):
+        where = ("contested zone relay" if "_cz_" in ct else "door" if "door" in ct
+                 else "fuse box" if "fusebox" in ct or "lever" in ct else "relay")
+        return "fuse", "Fuse inserted", where
+    if "hackingchip" in it:
+        m = re.search(r"access_level_(\w+?)(?:_\d+)?$", ct)
+        lvl = m.group(1) if m else ""
+        level = (f"level {lvl} access" if lvl.isdigit() else f"{lvl} access" if lvl
+                 else "comm array" if "commarray" in ct else "")
+        return "chip", "Hacking chip used", level
+    if "keycard" in it:
+        m = re.search(r"access_(?:[a-z]+_)*?([a-z]+)$", ct)
+        return "keycard", "Keycard used", KEYCARDS.get(m.group(1), split_camel(m.group(1))) if m else ""
+    if "harddrive" in it:
+        return "drive", "Hard drive inserted", "ASD facility" if "asd" in it else ""
+    if re.search(r"se(?:r)?verrack|serverblade", ct):           # the game spells it "SeverRack" too
+        return "blade", "Server blade inserted", "ASD facility" if "delving" in ct else ""
+    if "rockcracker" in ct:
+        return "crystal", "Crystal inserted", "Rockcracker"
+    if "vlk_egg" in it:
+        return "egg", "Valakkar egg delivered", ""
+    if it.startswith("mining_gadget"):
+        return "gadget", "Mining gadget placed", pretty_item(item[len("Mining_Gadget_"):])
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Parser: one line in, zero or more events out
 # ---------------------------------------------------------------------------
@@ -450,6 +532,8 @@ class Parser:
         self.pend = None            # multi-line HUD notification being assembled
         self.last = {}              # last values, used for de-duplication
         self.last_disco = None
+        self.mission_names = {}     # mission id -> contract name, to name the outcome
+        self.qt_real = False        # the quantum target is a real place (not a marker)
         self.state = {
             "handle": None, "shard": None, "channel": None, "version": None,
             "first_ts": None, "last_ts": None,
@@ -491,10 +575,10 @@ class Parser:
         return bool(prev and prev[0] == value and now and prev[1]
                     and (now - prev[1]).total_seconds() < window)
 
-    def _set_location(self, loc, ts, out, raw):
+    def _set_location(self, loc, ts, out, raw, system=None):
         if loc and self._changed("loc", loc):
             self.state["location"] = loc
-            self._ev(out, ts, "travel", "Location", loc, "info", raw)
+            self._ev(out, ts, "travel", "Location", loc, "info", raw, x=system or system_of_name(loc))
 
     # -- main entry -------------------------------------------------------------
     def feed(self, line):
@@ -524,7 +608,8 @@ class Parser:
                 em = NOTIF_END_RE.match(body)
                 if em:
                     self.pend = None
-                    self._notif(p["text"] + " " + em.group(1), em.group(2), p["ts"], p["raw"], out)
+                    self._notif(p["text"] + " " + em.group(1), em.group(2), p["ts"], p["raw"], out,
+                                self._mission_id(line))
                     return out
                 p["text"] += " " + body
                 if p["n"] >= 10:
@@ -538,7 +623,7 @@ class Parser:
         if NOTIF_START in line:
             nm = NOTIF_FULL_RE.search(line)
             if nm:
-                self._notif(nm.group(1), nm.group(2), ts, line, out)
+                self._notif(nm.group(1), nm.group(2), ts, line, out, self._mission_id(line))
             else:
                 start = line.index(NOTIF_START) + len(NOTIF_START)
                 self.pend = {"text": line[start:], "ts": ts, "raw": line, "n": 0}
@@ -547,8 +632,13 @@ class Parser:
         self._other(line, ts, out)
         return out
 
+    @staticmethod
+    def _mission_id(line):
+        m = NOTIF_MISSION_RE.search(line)
+        return m.group(1).lower() if m and m.group(1) != NO_MISSION else None
+
     # -- HUD notifications ------------------------------------------------------
-    def _notif(self, text, nid, ts, raw, out):
+    def _notif(self, text, nid, ts, raw, out, mission=None):
         if nid:
             if nid in self.notif_ids:
                 return
@@ -566,6 +656,8 @@ class Parser:
         m = re.match(r"Contract (Accepted|Complete|Failed|Available|Shared):\s*(.*)", t)
         if m:
             kind, name = m.group(1), m.group(2).strip(" :")
+            if mission and name and kind != "Available":
+                self.mission_names[mission] = name
             if kind == "Accepted":
                 S["contracts_acc"] += 1
                 ev("mission", "Contract accepted", name)
@@ -845,7 +937,7 @@ class Parser:
         if "<RequestLocationInventory>" in line:
             m = LOCINV_RE.search(line)
             if m and (S["handle"] is None or m.group(1) == S["handle"]):
-                self._set_location(pretty_loc(m.group(2)), ts, out, line)
+                self._set_location(pretty_loc(m.group(2)), ts, out, line, system_of_code(m.group(2)))
             return
         if "Projected Start Location is" in line:
             m = ROUTE_RE.search(line)
@@ -854,7 +946,7 @@ class Parser:
             return
         if QT_SELECT in line:
             m = QT_DEST_RE.search(line)
-            dest = pretty_dest(m.group(1))[0] if m else ""
+            dest, self.qt_real = pretty_dest(m.group(1)) if m else ("", False)
             sm = QT_SHIP_RE.search(line)
             if sm and not any(j in sm.group(1).lower() for j in SHIP_JUNK):
                 S["pilot_ship"] = pretty_class(sm.group(1))
@@ -867,7 +959,7 @@ class Parser:
         if "Player Requested Fuel to Quantum Target" in line:
             m = QT_FUEL_DEST_RE.search(line)
             if m and not S["qt_target"]:
-                S["qt_target"] = pretty_dest(m.group(1))[0]
+                S["qt_target"], self.qt_real = pretty_dest(m.group(1))
             return
         if any(k in line for k in QT_ARRIVE):
             S["qt_jumps"] += 1
@@ -878,7 +970,8 @@ class Parser:
             else:                            # someone else picked the target (crew / party)
                 sm = QT_SHIP_RE.search(line)
                 detail = f"aboard {pretty_class(sm.group(1))}, target set by the pilot" if sm else ""
-            ev("travel", "Quantum jump arrived", detail, "good")
+            self._ev(out, ts, "travel", "Quantum jump arrived", detail, "good", line,
+                     x=dest if dest and self.qt_real else None)
             if dest:
                 S["location"] = dest
                 self.last["loc"] = dest
@@ -921,6 +1014,14 @@ class Parser:
             else:
                 ev("combat", "Player died", actor + (f" ({detail})" if detail else ""))
             return
+        if "StatePlace::DoPlace]" in line:
+            m = PLACE_RE.search(line)
+            if m and (S["handle"] is None or m.group(1) == S["handle"]):
+                act = classify_placement(m.group(2), m.group(3))
+                if act:
+                    kind, title, detail = act
+                    self._ev(out, ts, "activity", title, detail, "info", line, x=kind)
+            return
         if "<MED BED HEAL>" in line:
             m = MEDBED_VEH_RE.search(line)
             return ev("combat", "Treated in med bed", pretty_class(m.group(1).strip()) if m else "", "good")
@@ -933,7 +1034,11 @@ class Parser:
             low = ctype.lower()
             level = "good" if "complete" in low or "success" in low else (
                 "bad" if "fail" in low or "abandon" in low else "info")
-            return ev("mission", "Mission ended", COMPLETION.get(low, ctype), level)
+            outcome = COMPLETION.get(low, ctype.lower())
+            im = ENDMISSION_ID_RE.search(line)
+            name = self.mission_names.get(im.group(1).lower()) if im else None
+            return self._ev(out, ts, "mission", "Mission ended", f"{outcome}: {name}" if name else outcome,
+                            level, line, x=outcome)
 
         # --- trade ---
         if "BuyRequest" in line and "Sending" in line:
@@ -945,13 +1050,15 @@ class Parser:
                 cm = COMMBUY_RE.search(line)
                 price = float(cm.group(1)) if cm else 0.0
                 S["spend"] += price
-                return ev("economy", "Bought cargo", f"{fmt_num(price)} aUEC{at}")
+                return self._ev(out, ts, "economy", "Bought cargo", f"{fmt_num(price)} aUEC{at}", "info", line,
+                                x=f"{price:.0f}")
             im = ITEMBUY_RE.search(line)
             if im:
                 price, item, qty = float(im.group(1)), pretty_item(im.group(2)), int(im.group(3))
                 S["spend"] += price
                 count = f"{qty}x " if qty > 1 else ""
-                return ev("economy", "Purchase", f"{count}{item} for {fmt_num(price)} aUEC{at}")
+                return self._ev(out, ts, "economy", "Purchase", f"{count}{item} for {fmt_num(price)} aUEC{at}",
+                                "info", line, x=f"{price:.0f}")
             return ev("economy", "Purchase", shop)
         if "RmShopFlowResponse" in line:
             m = SHOPRESP_RE.search(line)
@@ -1234,6 +1341,29 @@ class Store:
         out.sort(key=lambda v: v["start"], reverse=True)
         return out
 
+    def recap(self, frm=None, to=None):
+        """Recaps of the sessions overlapping the time range (newest first) and the places in them."""
+        cond, args = ["s.events > 0", "s.first_ts IS NOT NULL"], []
+        if to:
+            cond.append("s.first_ts <= ?")
+            args.append(to)
+        if frm:
+            cond.append("s.last_ts >= ?")
+            args.append(frm)
+        where = " AND ".join(cond)
+        with self.lock:
+            sessions = [dict(r) for r in self.db.execute(
+                f"SELECT s.id, s.first_ts, s.last_ts, s.handle, s.version FROM sessions s WHERE {where} "
+                "ORDER BY s.first_ts DESC", args)]
+            rows = self.db.execute(
+                "SELECT e.sid, e.ts, e.c, e.ti, e.d, e.x FROM events e JOIN sessions s ON s.id = e.sid "
+                f"WHERE {where} AND e.ts IS NOT NULL AND e.c != 'notice' ORDER BY e.sid, e.seq", args).fetchall()
+        by_sid = collections.defaultdict(list)
+        for r in rows:
+            by_sid[r["sid"]].append(r)
+        recaps = [build_recap(s, by_sid.get(s["id"], [])) for s in sessions]
+        return recaps, places_overview(recaps)
+
     def stats(self):
         with self.lock:
             row = self.db.execute(
@@ -1245,6 +1375,298 @@ class Store:
         except OSError:
             out["bytes"] = 0
         return out
+
+
+# ---------------------------------------------------------------------------
+# Session recap: where you were and what you did there
+# ---------------------------------------------------------------------------
+
+RECAP_MIN_STAY = 90          # shorter stops where nothing happened are left out
+SPAWN_BLIP = 600             # a place reported right after (re)spawning and left again within this
+SPAWN_WINDOW = 150           # ... many seconds, in between two stays at the same place, is a spawn artifact
+PAIR_WINDOW = 45             # a HUD message and the mission-end line within this many seconds are one outcome
+PARTY_TITLES = ("Party member joined", "Party member online", "Jumping to you", "Party invite", "Party launch",
+                "Came aboard", "New party leader")
+BUY_RE = re.compile(r"^(?:(\d+)x )?(.+?) for [\d,]+ aUEC")
+OUTCOME_LABEL = {"accepted": "Accepted", "completed": "Completed", "failed": "Failed",
+                 "abandoned": "Abandoned", "withdrawn": "Withdrawn"}
+
+
+def _chapter(place, system, start, via=None, spawned=False):
+    return {"place": place, "system": system, "start": start, "end": start, "via": via, "spawned": spawned,
+            "buys": {}, "spent": 0.0, "contracts": [], "flown": [], "boarded": [], "jumps": 0,
+            "acts": {}, "deaths": [], "downed": 0, "injuries": 0, "medbed": 0, "collisions": 0,
+            "kills": 0, "law": {}, "servers": [], "reconnects": 0, "blueprints": 0, "crash": None, "other": []}
+
+
+def _add_unique(items, value):
+    if value and value not in items:
+        items.append(value)
+
+
+def _count(d, key, n=1):
+    d[key] = d.get(key, 0) + n
+
+
+def _busy(ch):
+    return any(ch[k] for k in ("buys", "contracts", "flown", "boarded", "jumps", "acts", "deaths", "downed",
+                               "injuries", "medbed", "collisions", "kills", "law", "blueprints", "crash", "other"))
+
+
+def _merge(a, b):
+    a["end"] = max(a["end"], b["end"])
+    a["spent"] += b["spent"]
+    for k in ("jumps", "downed", "injuries", "medbed", "collisions", "kills", "reconnects", "blueprints"):
+        a[k] += b[k]
+    for k in ("buys", "acts", "law"):
+        for key, n in b[k].items():
+            _count(a[k], key, n)
+    for k in ("contracts", "deaths", "servers", "other"):
+        a[k].extend(b[k])
+    for k in ("flown", "boarded"):
+        for v in b[k]:
+            _add_unique(a[k], v)
+    a["crash"] = a["crash"] or b["crash"]
+
+
+def _times(n):
+    return f" ({n}×)" if n > 1 else ""
+
+
+def _lines(ch):
+    """The readable lines for one stop: what you did there."""
+    out = []
+
+    def add(cat, text):
+        out.append({"c": cat, "t": text})
+
+    if ch["flown"]:
+        add("ship", "Flew " + ", ".join(ch["flown"]))
+    if ch["boarded"]:
+        add("ship", "Aboard " + ", ".join(re.sub(r"\s+", " ", b) for b in ch["boarded"]))
+    if ch["jumps"]:
+        add("travel", f"{ch['jumps']} quantum jump{'s' if ch['jumps'] > 1 else ''}")
+    grouped = {}
+    for c in ch["contracts"]:
+        _count(grouped, (c["outcome"], c["name"] or ""))
+    for (outcome, name), n in grouped.items():
+        label = OUTCOME_LABEL.get(outcome, outcome.capitalize())
+        add("mission", (f"{label}: {name}" if name else f"Contract {outcome}") + _times(n))
+    if ch["buys"]:
+        items = [f"{n}× {item}" if n > 1 else item for item, n in ch["buys"].items()]
+        more = f" and {len(items) - 3} more" if len(items) > 3 else ""
+        add("economy", f"Bought {', '.join(items[:3])}{more} · {fmt_num(ch['spent'])} aUEC")
+    for (title, detail), n in ch["acts"].items():
+        add("activity", (f"{n}× " if n > 1 else "") + title + (f" · {detail}" if detail else ""))
+    if ch["blueprints"]:
+        add("economy", f"{ch['blueprints']} blueprint{'s' if ch['blueprints'] > 1 else ''} received")
+    for text in ch["other"]:
+        add("economy", text)
+    if ch["kills"]:
+        add("combat", f"{ch['kills']} kill{'s' if ch['kills'] > 1 else ''}")
+    if len(ch["deaths"]) == 1:
+        add("combat", "Died" + (f" ({ch['deaths'][0]})" if ch["deaths"][0] else ""))
+    elif ch["deaths"]:
+        add("combat", f"Died {len(ch['deaths'])}×")
+    if ch["downed"]:
+        add("combat", f"Downed, emergency services called{_times(ch['downed'])}")
+    if ch["injuries"]:
+        add("combat", f"{ch['injuries']} injur{'ies' if ch['injuries'] > 1 else 'y'}")
+    if ch["medbed"]:
+        add("combat", f"Treated in a med bed{_times(ch['medbed'])}")
+    if ch["collisions"]:
+        add("combat", f"Fatal collision{_times(ch['collisions'])}")
+    for title, n in ch["law"].items():
+        add("law", title + _times(n))
+    if ch["servers"]:
+        regions = sorted({shard_info(x)["region"] for x in ch["servers"]})
+        add("session", f"Changed server{_times(len(ch['servers']))} · {', '.join(regions)}")
+    if ch["reconnects"]:
+        add("session", f"Reconnected to the same server{_times(ch['reconnects'])}")
+    if ch["crash"]:
+        add("error", ch["crash"])
+    return out
+
+
+def build_recap(sess, events):
+    """Summary and stops of one session from its stored events."""
+    me = sess.get("handle")
+    chapters, outcomes = [], []
+    cur = _chapter(None, None, sess["first_ts"])
+    servers, flown, boarded, party, acts = {}, [], [], [], {}
+    totals = {"spent": 0.0, "buys": 0, "accepted": 0, "jumps": 0, "deaths": 0, "downed": 0,
+              "injuries": 0, "crashes": 0, "blueprints": 0}
+    last_shard, last_spawn = None, None
+
+    def outcome(kind, name, ts):
+        for o in reversed(outcomes):
+            if seconds_between(o["ts"], ts) > PAIR_WINDOW:
+                break
+            if o["outcome"] == kind and (not o["name"] or not name or o["name"] == name):
+                o["name"] = o["name"] or name
+                return
+        o = {"outcome": kind, "name": name, "ts": ts}
+        outcomes.append(o)
+        cur["contracts"].append(o)
+
+    for e in events:
+        ti, d, x, ts, cat = e["ti"], e["d"] or "", e["x"], e["ts"], e["c"]
+        if ti == "Location" or (ti == "Quantum jump arrived" and x):
+            place = d if ti == "Location" else x
+            if ti != "Location":
+                totals["jumps"] += 1
+            if place and place != cur["place"]:
+                cur["end"] = ts
+                chapters.append(cur)
+                system = (x if ti == "Location" else None) or system_of_name(place)
+                spawned = bool(last_spawn) and seconds_between(last_spawn, ts) <= SPAWN_WINDOW
+                cur = _chapter(place, system, ts, None if ti == "Location" else "quantum", spawned)
+            continue
+        if ti == "Quantum jump arrived":
+            totals["jumps"] += 1
+            cur["jumps"] += 1
+        elif ti in ("Purchase", "Bought cargo"):
+            try:
+                price = float(x)
+            except (TypeError, ValueError):
+                m = re.search(r"([\d,]+) aUEC", d)
+                price = float(m.group(1).replace(",", "")) if m else 0.0
+            m = BUY_RE.match(d) if ti == "Purchase" else None
+            item = m.group(2) if m else ("cargo" if ti == "Bought cargo" else (d or "something"))
+            _count(cur["buys"], item, int(m.group(1)) if m and m.group(1) else 1)
+            cur["spent"] += price
+            totals["spent"] += price
+            totals["buys"] += 1
+        elif ti == "Contract accepted":
+            totals["accepted"] += 1
+            cur["contracts"].append({"outcome": "accepted", "name": d, "ts": ts})
+        elif ti == "Mission ended":
+            kind, _, name = d.partition(": ")
+            outcome(x or kind, name, ts)
+        elif ti in ("Contract complete", "Contract failed"):
+            outcome("completed" if ti == "Contract complete" else "failed", d, ts)
+        elif ti in ("Took the controls", "Left pilot seat"):
+            _add_unique(cur["flown"], d)
+            _add_unique(flown, d)
+        elif ti == "Boarded":
+            _add_unique(cur["boarded"], d)
+            _add_unique(boarded, re.sub(r"\s+", " ", d))
+        elif cat == "activity":
+            _count(cur["acts"], (ti, d))
+            _count(acts, ti)
+        elif ti in ("You died", "Killed"):
+            cur["deaths"].append(d)
+            totals["deaths"] += 1
+        elif ti in ("Emergency services en route", "Incapacitated"):
+            cur["downed"] += 1
+            totals["downed"] += 1
+        elif ti.endswith(" injury"):
+            cur["injuries"] += 1
+            totals["injuries"] += 1
+        elif ti == "Treated in med bed":
+            cur["medbed"] += 1
+        elif ti == "Fatal collision":
+            cur["collisions"] += 1
+        elif ti == "Kill":
+            cur["kills"] += 1
+        elif cat == "law":
+            _count(cur["law"], ti)
+        elif ti == "Joined server":
+            shard = x or d.split(" · ")[0]
+            servers.setdefault(shard, shard_info(shard)["region"])
+            if last_shard == shard:
+                cur["reconnects"] += 1
+            elif last_shard:
+                cur["servers"].append(shard)
+            last_shard, last_spawn = shard, ts
+        elif ti == "Entered the universe":
+            last_spawn = ts
+        elif ti == "Blueprint received":
+            cur["blueprints"] += 1
+            totals["blueprints"] += 1
+        elif ti == "Crash!":
+            totals["crashes"] += 1
+            cur["crash"] = "Star Citizen crashed"
+        elif ti == "Crash cause":
+            cur["crash"] = f"Star Citizen crashed ({d})"
+        elif ti in ("Refinery order complete", "Money received", "Money sent"):
+            cur["other"].append(f"{ti}: {d}" if d else ti)
+        elif cat == "social" and ti in PARTY_TITLES and d:
+            name = re.sub(r"^(from|started by)\s+", "", d).split()[0]
+            if name != me and name not in ("invites",):
+                _add_unique(party, name)
+    cur["end"] = sess["last_ts"] or cur["start"]
+    chapters.append(cur)
+
+    kept = []
+    for i, ch in enumerate(chapters):
+        secs = seconds_between(ch["start"], ch["end"])
+        if ch["place"] is None and i + 1 < len(chapters) and secs < SPAWN_BLIP:
+            # what happened while loading in belongs to the first place you're at
+            _merge(chapters[i + 1], ch)
+            continue
+        if not _busy(ch) and (ch["place"] is None or secs < RECAP_MIN_STAY):
+            if kept:
+                kept[-1]["end"] = max(kept[-1]["end"], ch["end"])
+            continue
+        nxt = chapters[i + 1]["place"] if i + 1 < len(chapters) else None
+        if kept and ch["spawned"] and secs < SPAWN_BLIP and nxt == kept[-1]["place"]:
+            # After a server change the game briefly reports another place (e.g. your home
+            # station) before the real one: count it as the place around it.
+            _merge(kept[-1], ch)
+            continue
+        if kept and kept[-1]["place"] == ch["place"]:
+            _merge(kept[-1], ch)
+        else:
+            kept.append(ch)
+
+    stops, route = [], []
+    for ch in kept:
+        stops.append({"place": ch["place"], "system": ch["system"], "start": ch["start"], "end": ch["end"],
+                      "seconds": max(0, seconds_between(ch["start"], ch["end"])), "via": ch["via"],
+                      "lines": _lines(ch), "spent": round(ch["spent"]),
+                      "acts": {t: sum(n for (tt, _), n in ch["acts"].items() if tt == t) for t, _ in ch["acts"]},
+                      "contracts": sum(1 for c in ch["contracts"] if c["outcome"] == "accepted")})
+        if ch["place"] and not ch["place"].endswith(" System") and (not route or route[-1] != ch["place"]):
+            route.append(ch["place"])
+    done = {k: sum(1 for o in outcomes if o["outcome"] == k) for k in ("completed", "failed", "abandoned")}
+    summary = {"servers": [{"shard": k, "region": v} for k, v in servers.items()],
+               "flown": flown, "boarded": boarded, "party": party, "acts": acts, "route": route,
+               "spent": round(totals["spent"]), "buys": totals["buys"], "jumps": totals["jumps"],
+               "deaths": totals["deaths"], "downed": totals["downed"], "injuries": totals["injuries"],
+               "crashes": totals["crashes"], "blueprints": totals["blueprints"],
+               "contracts": {"accepted": totals["accepted"], **done}}
+    return {"sid": sess["id"], "start": sess["first_ts"], "end": sess["last_ts"],
+            "seconds": max(0, seconds_between(sess["first_ts"], sess["last_ts"])),
+            "version": sess.get("version"), "summary": summary, "chapters": stops}
+
+
+def places_overview(recaps):
+    """Every place in these sessions: visits, time there and what you did there."""
+    places = {}
+    for r in recaps:
+        for ch in r["chapters"]:
+            name = ch["place"]
+            if not name or name.endswith(" System"):
+                continue
+            p = places.setdefault(name, {"place": name, "system": ch["system"], "visits": 0, "sessions": set(),
+                                         "seconds": 0, "first": ch["start"], "last": ch["end"], "spent": 0,
+                                         "contracts": 0, "acts": {}})
+            p["visits"] += 1
+            p["sessions"].add(r["sid"])
+            p["seconds"] += ch["seconds"]
+            p["first"], p["last"] = min(p["first"], ch["start"]), max(p["last"], ch["end"])
+            p["spent"] += ch["spent"]
+            p["contracts"] += ch["contracts"]
+            p["system"] = p["system"] or ch["system"]
+            for k, n in ch["acts"].items():
+                _count(p["acts"], k, n)
+    out = []
+    for p in places.values():
+        p["sessions"] = len(p["sessions"])
+        out.append(p)
+    out.sort(key=lambda p: p["seconds"], reverse=True)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1289,6 +1711,13 @@ class Hub:
         self.clients.discard(q)
         if not self.clients and self.empty_since is None:
             self.empty_since = time.time()
+
+    def game_running(self):
+        """True while Star Citizen is writing to the followed log (a line in the last few minutes)."""
+        if self.mode != "live":
+            return False
+        last = to_dt(self.parser.state.get("last_ts"))
+        return bool(last and (datetime.now(timezone.utc) - last).total_seconds() < 180)
 
     def dashboard_closed_for(self):
         """Seconds since the last dashboard tab was closed, or None while one is open (or none ever was)."""
@@ -1600,7 +2029,7 @@ class ReplaySource(threading.Thread):
 
 
 # ---------------------------------------------------------------------------
-# Settings, file dialog and autostart
+# Settings and file dialog
 # ---------------------------------------------------------------------------
 
 def load_config():
@@ -1673,53 +2102,17 @@ RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = APP_NAME
 
 
-def autostart_supported():
-    return os.name == "nt"
-
-
-def autostart_command():
-    if getattr(sys, "frozen", False):
-        return f'"{sys.executable}" --background'
-    exe = Path(sys.executable)
-    pythonw = exe.with_name("pythonw.exe")
-    return f'"{pythonw if pythonw.exists() else exe}" "{Path(__file__).resolve()}" --background'
-
-
-def get_autostart():
-    if not autostart_supported():
-        return None
-    import winreg
-    try:
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:
-            return winreg.QueryValueEx(key, RUN_NAME)[0]
-    except OSError:
-        return None
-
-
-def set_autostart(enabled):
-    """Start with Windows (current user only) in the background."""
-    if not autostart_supported():
+def remove_old_autostart():
+    """Versions before 1.4 could start with Windows. That option is gone: remove its entry."""
+    if os.name != "nt":
         return False
-    import winreg
-    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
-        if enabled:
-            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
-        else:
-            try:
-                winreg.DeleteValue(key, RUN_NAME)
-            except FileNotFoundError:
-                pass
-    return bool(get_autostart())
-
-
-def refresh_autostart():
-    """Keep the autostart entry pointing at this copy of the app if it was moved or updated."""
     try:
-        current = get_autostart()
-        if current and current != autostart_command():
-            set_autostart(True)
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, RUN_NAME)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -1781,7 +2174,7 @@ class Handler(BaseHTTPRequestHandler):
             visits = hub.store.server_visits(frm, to)
             servers, regions = {}, {}
             for v in visits:
-                v["live"] = bool(v["open"] and v["sid"] == hub.sid and hub.mode == "live")
+                v["live"] = bool(v["open"] and v["sid"] == hub.sid and hub.game_running())
                 s = servers.setdefault(v["shard"], {"shard": v["shard"], "region": v["region"], "build": v["build"],
                                                     "number": v["number"], "visits": 0, "seconds": 0,
                                                     "first": v["start"], "last": v["end"], "live": False})
@@ -1796,10 +2189,18 @@ class Handler(BaseHTTPRequestHandler):
                                "servers": sorted(servers.values(), key=lambda s: s["last"], reverse=True),
                                "regions": sorted(regions.values(), key=lambda r: r["seconds"], reverse=True)})
         if url.path == "/api/sessions":
-            rows = hub.store.sessions()
+            rows, running = hub.store.sessions(), hub.game_running()
             for r in rows:
-                r["live"] = r["id"] == hub.sid and hub.mode == "live"
+                r["live"] = running and r["id"] == hub.sid
             return self._json({"sessions": rows})
+        if url.path == "/api/recap":
+            frm = (qs.get("from") or [None])[0] or None
+            to = (qs.get("to") or [None])[0] or None
+            recaps, places = hub.store.recap(frm, to)
+            running = hub.game_running()
+            for r in recaps:
+                r["live"] = running and r["sid"] == hub.sid
+            return self._json({"sessions": recaps, "places": places})
         if url.path == "/api/config":
             return self._json(self._config())
         self._send(404, "text/plain", b"not found")
@@ -1830,13 +2231,6 @@ class Handler(BaseHTTPRequestHandler):
             if err:
                 return self._json({"error": err}, 501)
             return self._json({"path": chosen} if chosen else {"cancelled": True})
-        if path == "/api/autostart":
-            if not autostart_supported():
-                return self._json({"error": "Only available on Windows."}, 400)
-            try:
-                return self._json({"ok": True, "enabled": set_autostart(bool(body.get("enabled")))})
-            except OSError as e:
-                return self._json({"error": f"Couldn't change the setting: {e}"}, 500)
         if path == "/api/quit":
             self._json({"ok": True})
             con(str(body.get("reason") or "Quit from the dashboard.")[:200], "90")
@@ -1846,21 +2240,9 @@ class Handler(BaseHTTPRequestHandler):
 
     def _config(self):
         hub = self.hub
-        detected = []
-        for p in find_game_logs():
-            try:
-                modified = datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="minutes")
-            except OSError:
-                modified = None
-            detected.append({"path": str(p), "channel": p.parent.name, "modified": modified})
-        enabled = None
-        if autostart_supported():
-            try:
-                enabled = bool(get_autostart())
-            except OSError:
-                enabled = False
-        return {"log": hub.meta.get("path"), "mode": hub.mode, "detected": detected,
-                "autostart": {"supported": autostart_supported(), "enabled": enabled},
+        found = find_game_logs()
+        return {"log": hub.meta.get("path"), "mode": hub.mode,
+                "default_log": str(found[0]) if found else DEFAULT_LOG,
                 "data_dir": str(DATA_DIR), "history": hub.store.stats(), "version": __version__}
 
     def _stream(self):
@@ -2032,10 +2414,10 @@ class AutoQuit(threading.Thread):
 # Console output
 # ---------------------------------------------------------------------------
 
-CAT_LABEL = {"session": "Session", "travel": "Travel", "ship": "Ship", "mission": "Mission",
+CAT_LABEL = {"session": "Session", "travel": "Travel", "ship": "Ship", "mission": "Mission", "activity": "Activity",
              "economy": "Trade", "combat": "Combat", "law": "Law", "social": "Party",
              "notice": "Notice", "error": "Error"}
-CAT_ANSI = {"session": "90", "travel": "96", "ship": "94", "mission": "93", "economy": "92",
+CAT_ANSI = {"session": "90", "travel": "96", "ship": "94", "mission": "93", "activity": "36", "economy": "92",
             "combat": "91", "law": "33", "social": "95", "notice": "37", "error": "31;1"}
 USE_COLOR = True
 
@@ -2055,7 +2437,7 @@ def print_event(e):
     con(f"[{local_time(e['ts'])}] {label} {e['ti']}{detail}", CAT_ANSI.get(e["c"]))
 
 
-NO_CONSOLE = False      # started without a console (the .exe, pythonw, autostart)
+NO_CONSOLE = False      # started without a console (the .exe or pythonw)
 
 
 def setup_output():
@@ -2182,9 +2564,8 @@ def parse_args(argv=None):
         description="Real-time viewer and history for the Star Citizen Game.log.",
         epilog=REPO_URL)
     ap.add_argument("log", nargs="?", help="Game.log, LIVE folder or StarCitizen folder")
-    ap.add_argument("--background", action="store_true",
-                    help="run without browser and console output, and keep running when the dashboard "
-                         "is closed (used for autostart)")
+    # Used by the "Start with Windows" entry of versions before 1.4: now it only removes that entry.
+    ap.add_argument("--background", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--replay", metavar="FILE",
                     help="replay a log file, not saved to history ('last' = newest file in logbackups)")
     ap.add_argument("--speed", type=float, default=30.0, help="replay speed (default 30x)")
@@ -2209,8 +2590,12 @@ def run(args):
     except Exception:  # noqa: BLE001
         pass
     USE_COLOR = interactive and not args.no_color
-    quiet = args.quiet or args.background
-    open_browser = not (args.no_browser or args.background)
+    quiet = args.quiet
+    open_browser = not args.no_browser
+
+    if args.background:                  # started by an old "Start with Windows" entry
+        remove_old_autostart()
+        return
 
     con(f"{APP_NAME} {__version__}", "96")
 
@@ -2242,18 +2627,11 @@ def run(args):
     else:
         hub.set_meta(needs_setup=True)
         con("Couldn't find your Game.log. Choose it in the dashboard.", "93")
-    if not args.replay:
-        refresh_autostart()
-    hub.meta["auto_quit"] = not args.background
-    if not args.background:
-        # Started by you: close the dashboard and the app goes too. Started with Windows
-        # (--background): keep recording in the background until you quit it in the settings.
-        AutoQuit(hub).start()
+    if not args.replay and remove_old_autostart():
+        con("Removed the old \"Start with Windows\" entry.", "90")
+    AutoQuit(hub).start()                # close the dashboard and the app goes too
     con(f"Viewer:   {url}", "92")
-    if args.background:
-        con("Running in the background. Use Settings > Quit in the dashboard to stop.\n", "90")
-    else:
-        con("Closing the dashboard stops the tracker (or press Ctrl+C).\n", "90")
+    con("Closing the dashboard stops the tracker (or press Ctrl+C).\n", "90")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
@@ -2295,7 +2673,8 @@ PAGE = r"""<!doctype html>
   --text:#d6e2f3;--muted:#7488a6;--faint:#3d4c66;--accent:#3cc8f2;
   --good:#6fe0a0;--bad:#ff8080;--warn:#ffc266;
   --c-session:#8d9bb5;--c-travel:#3cc8f2;--c-ship:#7f9dff;--c-mission:#f2c94c;--c-economy:#4fd18b;
-  --c-combat:#ff6464;--c-law:#ff9a3d;--c-social:#c792ea;--c-notice:#9aa8bd;--c-error:#ff3d63;
+  --c-combat:#ff6464;--c-law:#ff9a3d;--c-social:#c792ea;--c-notice:#9aa8bd;--c-error:#ff3d63;--c-activity:#f78fb3;
+  --s-stanton:#3cc8f2;--s-pyro:#ff9a3d;--s-nyx:#a98bff;
   --mono:"Cascadia Mono","Consolas","SFMono-Regular",monospace;
   color-scheme:dark;
 }
@@ -2342,16 +2721,6 @@ h2{margin:0 0 8px;font-size:11px;font-weight:600;letter-spacing:.14em;text-trans
   display:flex;justify-content:space-between;align-items:baseline}
 h2 small{font-size:11px;letter-spacing:0;text-transform:none;font-weight:400;color:var(--faint)}
 .box{background:var(--panel);border:1px solid var(--line);border-radius:8px}
-.now{padding:4px 12px}
-.now .r{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding:7px 0;border-bottom:1px solid var(--line2)}
-.now .r:last-child{border-bottom:0}
-.now .k{font-size:12px;color:var(--muted);white-space:nowrap}
-.now .v{text-align:right;font-weight:600;overflow-wrap:anywhere}
-.now .v.empty{color:var(--faint);font-weight:400}
-.pill{display:inline-block;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;border:1px solid}
-.pill.safe{color:var(--good);border-color:rgba(111,224,160,.4)}
-.pill.risk{color:var(--warn);border-color:rgba(255,194,102,.4)}
-.pill.danger{color:var(--bad);border-color:rgba(255,128,128,.4)}
 .range{padding:10px 12px;display:flex;flex-direction:column;gap:10px}
 .presets{display:flex;flex-wrap:wrap;gap:5px}
 .preset{background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:3px 9px;font-size:12px;cursor:pointer;color:var(--muted)}
@@ -2380,12 +2749,12 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 .rangelabel{margin-left:auto;font-size:12px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .toolbar{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:9px 12px;border-bottom:1px solid var(--line)}
 .chip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);background:var(--panel);
-  color:var(--faint);border-radius:999px;padding:3px 10px;font-size:12px;cursor:pointer;user-select:none}
+  color:var(--faint);border-radius:999px;padding:3px 9px;font-size:12px;cursor:pointer;user-select:none}
 .chip .sw{width:8px;height:8px;border-radius:50%;background:var(--cc);opacity:.35}
 .chip.on{color:var(--text);border-color:color-mix(in srgb,var(--cc) 55%,var(--line))}
 .chip.on .sw{opacity:1}
 .chip .cnt{color:var(--muted);font-variant-numeric:tabular-nums}
-.search{margin-left:auto;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 10px;width:220px;outline:0}
+.search{margin-left:12px;background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:5px 10px;width:220px;min-width:140px;flex:0 1 220px;outline:0}
 .search:focus{border-color:var(--accent)}
 .list{flex:1;overflow:auto;min-height:0}
 .day{position:sticky;top:0;z-index:1;padding:6px 14px;font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;
@@ -2425,6 +2794,39 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 .srvtab td{padding:7px 14px;border-bottom:1px solid var(--line2);color:var(--muted)}
 .srvtab td.num,.srvtab th.num{text-align:right;font-variant-numeric:tabular-nums}
 .srvtab tr:hover td{background:#0a1220}
+.rc{border-bottom:1px solid var(--line)}
+.rch{padding:12px 14px;cursor:pointer;display:flex;flex-direction:column;gap:8px}
+.rch:hover{background:#0a1220}
+.rct{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
+.rct b{font-size:14px;font-weight:650}
+.rct .t{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.rct .du{margin-left:auto;color:var(--muted);font-variant-numeric:tabular-nums;font-size:12.5px}
+.chev{display:inline-block;color:var(--faint);transition:transform .15s;width:10px;font-size:11px}
+.rc.open .chev{transform:rotate(90deg)}
+.pills{display:flex;flex-wrap:wrap;gap:6px}
+.pl{font-size:12px;color:var(--text);border:1px solid color-mix(in srgb,var(--cc) 40%,var(--line));border-radius:999px;padding:1px 9px;background:color-mix(in srgb,var(--cc) 8%,transparent)}
+.pbar{display:flex;height:6px;border-radius:3px;overflow:hidden;background:var(--line);gap:2px}
+.pbar i{display:block;height:100%;background:var(--sc);min-width:3px}
+.route{font-size:12.5px;color:var(--muted);line-height:1.6}
+.route .arr{color:var(--faint);margin:0 2px}
+.rc.open .route{display:none}
+.rcb{padding:0 14px 14px 20px}
+.chp{display:grid;grid-template-columns:44px minmax(0,1fr) 64px;gap:12px;padding:8px 10px;border-left:2px solid var(--sc);cursor:pointer}
+.chp:hover{background:#0a1220}
+.chp .t{font-family:var(--mono);font-size:12px;color:var(--muted);padding-top:1px}
+.cht{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cht b{font-weight:650}
+.sys{font-size:11px;font-weight:600;color:var(--sc);border:1px solid color-mix(in srgb,var(--sc) 45%,transparent);border-radius:999px;padding:0 8px;white-space:nowrap}
+.via{font-size:11.5px;color:var(--faint)}
+.chp ul{margin:5px 0 0;padding:0;list-style:none;display:flex;flex-direction:column;gap:3px}
+.chp li{font-size:12.5px;color:var(--muted);padding-left:13px;position:relative;overflow-wrap:anywhere}
+.chp li::before{content:"";position:absolute;left:0;top:.5em;width:6px;height:6px;border-radius:50%;background:var(--cc)}
+.chp .du{text-align:right;font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+.rcf{padding:10px 0 0 12px}
+.plc td{vertical-align:baseline}
+.plc .pn{color:var(--text);font-weight:600}
+.plc td:last-child,.plc td.num{white-space:nowrap}
+.plc tbody tr{cursor:pointer}
 .rawlist{font-family:var(--mono);font-size:12px;line-height:1.5;padding:4px 0}
 .rl{display:grid;grid-template-columns:64px minmax(0,1fr);padding:0 14px 0 11px;border-left:3px solid transparent;color:#8193ad}
 .rl .tx{white-space:pre-wrap;word-break:break-all}
@@ -2448,23 +2850,20 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
 .row{display:flex;gap:8px;align-items:center}
 .row input[type=text]{flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;font-family:var(--mono);font-size:12px;outline:0}
 .row input[type=text]:focus{border-color:var(--accent)}
-.found{display:flex;flex-direction:column;gap:6px}
-.found button{display:flex;justify-content:space-between;gap:10px;text-align:left;background:var(--panel2);border:1px solid var(--line);border-radius:6px;padding:7px 10px;cursor:pointer}
-.found button:hover{border-color:var(--accent)}
-.found .p{font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
-.found .m{font-size:11.5px;color:var(--faint);white-space:nowrap}
+.defpath{font-family:var(--mono);font-size:11.5px;color:var(--faint);overflow-wrap:anywhere;margin-top:-4px;cursor:pointer;background:none;border:0;padding:0;text-align:left}
+.defpath:hover{color:var(--muted)}
 .msg{font-size:12.5px;min-height:1em}
 .msg.err{color:var(--bad)} .msg.ok{color:var(--good)}
-.switch{display:flex;gap:10px;align-items:flex-start;cursor:pointer;font-size:13px}
-.switch input{margin-top:3px;accent-color:var(--accent)}
 .stopped{position:fixed;inset:0;background:var(--bg);display:none;align-items:center;justify-content:center;flex-direction:column;gap:8px;z-index:40;color:var(--muted)}
 .stopped.show{display:flex}
 @media (max-width:860px){
   main{grid-template-columns:1fr;grid-template-rows:auto 1fr}
   aside{border-right:0;border-bottom:1px solid var(--line);max-height:46vh}
-  .path,.who .opt,.rangelabel{display:none}
-  .search{width:100%;margin-left:0}
+  .path,.who,.rangelabel{display:none}
+  header{flex-wrap:wrap;gap:8px 12px} .status{flex-shrink:1;white-space:normal} header .btn:first-of-type{margin-left:auto}
+  .tabs{flex-wrap:wrap;padding-bottom:8px} .search{flex:1 1 100%;margin-left:0}
   .ev{grid-template-columns:62px minmax(0,1fr)} .ev .b{display:none} .ev .raw{grid-column:1/-1}
+  .chp{grid-template-columns:40px minmax(0,1fr)} .chp .du{display:none} .rcb{padding-left:10px}
 }
 </style>
 </head>
@@ -2487,17 +2886,6 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
 <div class="banner" id="banner"><span id="bannerText"></span><span class="bar" id="bannerBar"><i></i></span></div>
 <main>
   <aside>
-    <div>
-      <h2>Now</h2>
-      <div class="box now">
-        <div class="r"><span class="k">Location</span><span class="v" id="nLoc"></span></div>
-        <div class="r"><span class="k">Jurisdiction</span><span class="v" id="nJur"></span></div>
-        <div class="r"><span class="k">Zone</span><span class="v" id="nZone"></span></div>
-        <div class="r"><span class="k">Ship</span><span class="v" id="nShip"></span></div>
-        <div class="r"><span class="k">Quantum target</span><span class="v" id="nQt"></span></div>
-        <div class="r"><span class="k">Server</span><span class="v" id="nShard"></span></div>
-      </div>
-    </div>
     <div>
       <h2>Time range</h2>
       <div class="box range">
@@ -2524,19 +2912,23 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
   <section class="feed">
     <div class="tabs">
       <button class="tab on" data-tab="ev">Events<span class="n" id="cEv">0</span></button>
+      <button class="tab" data-tab="ses" title="Where you were and what you did there">Sessions<span class="n" id="cSes">0</span></button>
       <button class="tab" data-tab="srv" title="Which servers (shards) you were on">Servers<span class="n" id="cSrv">0</span></button>
       <button class="tab" data-tab="raw" title="Raw lines of the current game session">Raw log<span class="n" id="cRaw">0</span></button>
       <span class="rangelabel" id="rangeLabel"></span>
+      <input class="search" id="search" type="search" placeholder="Search ..." autocomplete="off">
     </div>
     <div class="toolbar">
       <span id="chips" style="display:contents"></span>
+      <button class="btn on" id="btnRecap" style="display:none" title="One card per session: your stops and what you did there">Sessions</button>
+      <button class="btn" id="btnPlaces" style="display:none" title="Every place you were: visits, time and what you did there">Places</button>
       <button class="btn on" id="btnVisits" style="display:none" title="Every time you joined a server">Visits</button>
       <button class="btn" id="btnByServer" style="display:none" title="One row per server">By server</button>
       <button class="btn" id="btnHits" style="display:none" title="Only show lines that produced an event">Matches only</button>
       <button class="btn on" id="btnScroll" style="display:none">Auto-scroll</button>
-      <input class="search" id="search" type="search" placeholder="Search ..." autocomplete="off">
     </div>
     <div class="list" id="evList"></div>
+    <div class="list" id="sesList" style="display:none"></div>
     <div class="list" id="srvList" style="display:none"></div>
     <div class="list rawlist" id="rawList" style="display:none"></div>
   </section>
@@ -2550,13 +2942,8 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
       <p id="setIntro">Where Star Citizen writes its log. Pick the Game.log file, or your StarCitizen or LIVE folder.</p>
       <div class="row"><input type="text" id="setPath" placeholder="C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log" spellcheck="false">
         <button class="btn" id="setBrowse">Browse ...</button><button class="btn primary" id="setSave">Use this</button></div>
+      <button class="defpath" id="setDefault" title="Use this path"></button>
       <div class="msg" id="setMsg"></div>
-      <div class="found" id="setFound"></div>
-    </div>
-    <div class="dsec" id="setAutoSec">
-      <h4>Start with Windows</h4>
-      <label class="switch"><input type="checkbox" id="setAuto"><span>Start SC Log Tracker in the background when you sign in to Windows. That copy runs without a window and records live while you play, even when the dashboard is closed. Open the dashboard any time by starting the app again.</span></label>
-      <div class="msg" id="autoMsg"></div>
     </div>
     <div class="dsec">
       <h4>History</h4>
@@ -2565,18 +2952,19 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
     </div>
     <div class="dsec">
       <h4>Tracker</h4>
-      <div class="row"><button class="btn danger" id="btnQuit">Quit SC Log Tracker</button><span class="hint" id="quitHint">Stops the tracker. Closing the dashboard does the same.</span></div>
+      <div class="row"><button class="btn danger" id="btnQuit">Quit SC Log Tracker</button><span class="hint">Stops the tracker. Closing the dashboard does the same after a few seconds.</span></div>
     </div>
   </div>
 </div>
 <div class="stopped" id="stopped"><b>SC Log Tracker has stopped.</b><span>You can close this tab.</span></div>
 <div class="toast" id="toast"></div>
 <script>
-const CATS={session:"Session",travel:"Travel",ship:"Ship",mission:"Mission",economy:"Trade",
+const CATS={session:"Session",travel:"Travel",ship:"Ship",mission:"Mission",activity:"Activity",economy:"Trade",
   combat:"Combat",law:"Law",social:"Party",notice:"Notice",error:"Error"};
 const MAX_RAW=4000, PAGE_SIZE=400;
 let events=[], total=0, limit=0, raw=[], state={}, meta={}, sessions=[];
 let active=new Set(Object.keys(CATS)), query="", tab="ev", onlyHits=false, autoScroll=true;
+const TABS=["ev","ses","srv","raw"];
 let connected=false, lastLineAt=0, shownList=[], rendered=0, loadSeq=0, lastImportRunning=false, stopped=false;
 let range=loadRange();
 const $=id=>document.getElementById(id);
@@ -2624,13 +3012,13 @@ function renderRange(){
   $("rangeLabel").textContent = lbl + (live?" · live":"");
   document.querySelectorAll(".ses").forEach(el=>el.classList.toggle("on",el.dataset.id===range.sid));
 }
-function setRange(r){ range=r; saveRange(); renderRange(); loadEvents(); }
+function setRange(r){ range=r; saveRange(); recOpen=null; renderRange(); loadEvents(); }
 $("presets").addEventListener("click",e=>{ const b=e.target.closest(".preset"); if(b) setRange({preset:b.dataset.p}); });
 function customChanged(){ const f=fromInput($("rFrom").value), t=fromInput($("rTo").value); setRange({preset:"custom",from:f,to:t}); }
 $("rFrom").addEventListener("change",customChanged); $("rTo").addEventListener("change",customChanged);
 
 function loadEvents(){
-  loadServers();
+  loadServers(); loadRecap();
   const b=bounds(), seq=++loadSeq; const qs=new URLSearchParams();
   if(b.from) qs.set("from",b.from); if(b.to) qs.set("to",b.to);
   api("/api/events?"+qs).then(res=>{ if(seq!==loadSeq||res.error) return;
@@ -2706,14 +3094,20 @@ $("chips").addEventListener("click",ev=>{ const c=ev.target.closest(".chip"); if
   clearTimeout(chipTimer); chipTimer=setTimeout(()=>{ const k=c.dataset.c; active.has(k)?active.delete(k):active.add(k); renderChips(); renderEvents(); },200); });
 $("chips").addEventListener("dblclick",ev=>{ const c=ev.target.closest(".chip"); if(!c) return; clearTimeout(chipTimer);
   const k=c.dataset.c; active = (active.size===1 && active.has(k)) ? new Set(Object.keys(CATS)) : new Set([k]); renderChips(); renderEvents(); });
-document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{
-  tab=b.dataset.tab; document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b));
-  $("evList").style.display=tab==="ev"?"":"none"; $("rawList").style.display=tab==="raw"?"":"none"; $("srvList").style.display=tab==="srv"?"":"none";
+function showTab(name){
+  tab=TABS.includes(name)?name:"ev"; try{ localStorage.setItem("sclt.tab",tab); }catch(e){}
+  document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x.dataset.tab===tab));
+  $("evList").style.display=tab==="ev"?"":"none"; $("rawList").style.display=tab==="raw"?"":"none";
+  $("srvList").style.display=tab==="srv"?"":"none"; $("sesList").style.display=tab==="ses"?"":"none";
   $("btnHits").style.display=$("btnScroll").style.display=tab==="raw"?"":"none";
   $("btnVisits").style.display=$("btnByServer").style.display=tab==="srv"?"":"none";
-  renderChips(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); }));
+  $("btnRecap").style.display=$("btnPlaces").style.display=tab==="ses"?"":"none";
+  renderChips(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); if(tab==="ses") renderRecap();
+}
+document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>showTab(b.dataset.tab)));
 let searchTimer=null;
-$("search").addEventListener("input",e=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{ query=e.target.value.trim(); renderEvents(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); },150); });
+function setQuery(v){ query=v; renderEvents(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); if(tab==="ses") renderRecap(); }
+$("search").addEventListener("input",e=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>setQuery(e.target.value.trim()),150); });
 $("btnHits").addEventListener("click",()=>{ onlyHits=!onlyHits; $("btnHits").classList.toggle("on",onlyHits); renderRaw(); });
 $("btnScroll").addEventListener("click",()=>{ autoScroll=!autoScroll; $("btnScroll").classList.toggle("on",autoScroll); if(autoScroll){ const l=$("rawList"); l.scrollTop=l.scrollHeight; } });
 function updateCounts(){ $("cEv").textContent=num(total); $("cRaw").textContent=num(state.lines); }
@@ -2757,12 +3151,101 @@ function renderServers(){
   list.innerHTML=html;
 }
 $("srvList").addEventListener("click",e=>{ const el=e.target.closest(".vis"); if(!el) return; const v=srv.visits[+el.dataset.i]; if(!v) return;
-  setRange({preset:"custom",from:v.start,to:v.live?null:v.end}); document.querySelector('.tab[data-tab="ev"]').click(); });
+  setRange({preset:"custom",from:v.start,to:v.live?null:v.end}); showTab("ev"); });
 $("btnVisits").addEventListener("click",()=>{ srvView="visits"; $("btnVisits").classList.add("on"); $("btnByServer").classList.remove("on"); renderServers(); });
 $("btnByServer").addEventListener("click",()=>{ srvView="servers"; $("btnByServer").classList.add("on"); $("btnVisits").classList.remove("on"); renderServers(); });
 setInterval(()=>{ if(tab==="srv" && srv.visits.some(v=>v.live)) renderServers(); },30000);
 
-/* ---------- sessions ---------- */
+/* ---------- sessions: where you were and what you did ---------- */
+let rec={sessions:[],places:[]}, recView="sessions", recSeq=0, recOpen=null, recTimer=null;
+const sc=s=>({Stanton:"var(--s-stanton)",Pyro:"var(--s-pyro)",Nyx:"var(--s-nyx)"}[s]||"var(--faint)");
+const plural=(n,w,ws)=>`${num(n)} ${n===1?w:(ws||w+"s")}`;
+function loadRecap(){ const b=bounds(), seq=++recSeq, qs=new URLSearchParams();
+  if(b.from) qs.set("from",b.from); if(b.to) qs.set("to",b.to);
+  api("/api/recap?"+qs).then(r=>{ if(seq!==recSeq||r.error) return; rec=r; $("cSes").textContent=num(r.sessions.length); if(tab==="ses") renderRecap(); }); }
+function recSoon(){ clearTimeout(recTimer); recTimer=setTimeout(loadRecap,8000); }
+function placeName(ch){ return !ch.place ? "Unknown location" : (/ System$/.test(ch.place) ? "In space" : ch.place); }
+function chEnd(ch,r){ return r.live && ch===r.chapters[r.chapters.length-1] ? new Date() : new Date(ch.end); }
+function recText(r){ return [r.summary.party.join(" "), ...r.chapters.map(ch=>placeName(ch)+" "+(ch.system||"")+" "+ch.lines.map(l=>l.t).join(" "))].join(" ").toLowerCase(); }
+function sumPills(s){ const p=[], regions=[...new Set(s.servers.map(x=>x.region))], c=s.contracts;
+  if(s.servers.length) p.push(["session",`${plural(s.servers.length,"server")} · ${regions.join(", ")}`]);
+  if(s.flown.length) p.push(["ship","Flew "+s.flown.slice(0,2).join(", ")+(s.flown.length>2?` +${s.flown.length-2}`:"")]);
+  else if(s.boarded.length) p.push(["ship","Aboard "+s.boarded[0].replace(/ \(.*\)$/,"")+(s.boarded.length>1?` +${s.boarded.length-1}`:"")]);
+  if(s.spent) p.push(["economy",num(s.spent)+" aUEC spent"]);
+  const done=[c.completed&&`${c.completed} completed`,c.failed&&`${c.failed} failed`,c.abandoned&&`${c.abandoned} abandoned`].filter(Boolean);
+  if(c.accepted||done.length) p.push(["mission",(c.accepted?plural(c.accepted,"contract")+(done.length?": ":" accepted"):"Contracts: ")+done.join(", ")]);
+  Object.entries(s.acts).sort((a,b)=>b[1]-a[1]).slice(0,2).forEach(([k,n])=>p.push(["activity",`${n>1?n+"× ":""}${k.toLowerCase()}`]));
+  if(s.jumps) p.push(["travel",plural(s.jumps,"quantum jump")]);
+  if(s.deaths) p.push(["combat",`died ${s.deaths}×`]); else if(s.downed) p.push(["combat",`downed ${s.downed}×`]);
+  if(s.party.length) p.push(["social","with "+s.party.slice(0,3).join(", ")+(s.party.length>3?` +${s.party.length-3}`:"")]);
+  if(s.crashes) p.push(["error",s.crashes>1?`crashed ${s.crashes}×`:"crashed"]);
+  return p.map(([k,t])=>`<span class="pl" style="--cc:var(--c-${k})">${hl(t)}</span>`).join("");
+}
+function chHtml(r,ch,i){
+  const secs=(chEnd(ch,r)-new Date(ch.start))/1000;
+  return `<div class="chp" data-i="${i}" style="--sc:${sc(ch.system)}" title="Show the events of this stop">
+    <span class="t">${tLocal(ch.start).slice(0,5)}</span>
+    <div><div class="cht"><b>${hl(placeName(ch))}</b>${ch.system?`<span class="sys">${esc(ch.system)}</span>`:""}${ch.via==="quantum"?'<span class="via">by quantum jump</span>':""}</div>
+      ${ch.lines.length?`<ul>${ch.lines.map(l=>`<li style="--cc:var(--c-${l.c})">${hl(l.t)}</li>`).join("")}</ul>`:""}</div>
+    <span class="du">${secs>=60?"~"+hm(secs):"&lt;1m"}</span></div>`;
+}
+function recHtml(r,open){
+  const secs=r.live?Math.max(r.seconds,(Date.now()-new Date(r.start))/1000):r.seconds;
+  const segs=r.chapters.map(ch=>({ch,w:Math.max(0,chEnd(ch,r)-new Date(ch.start))})), tot=segs.reduce((a,x)=>a+x.w,0)||1;
+  const bar=segs.length?`<div class="pbar">${segs.map(x=>`<i style="--sc:${sc(x.ch.system)};width:${(100*x.w/tot).toFixed(2)}%" title="${esc(placeName(x.ch))} · ${hm(x.w/1000)}"></i>`).join("")}</div>`:"";
+  const route=r.summary.route.map(p=>hl(p)).join('<span class="arr"> → </span>');
+  return `<div class="rc${open?" open":""}" data-sid="${r.sid}">
+    <div class="rch" title="${open?"Hide":"Show"} the stops of this session"><div class="rct"><span class="chev">▶</span><b>${dayLabel(r.start)}</b>
+      <span class="t">${tLocal(r.start).slice(0,5)} – ${r.live?"now":tLocal(r.end).slice(0,5)}</span>${r.live?'<span class="badge">LIVE</span>':""}<span class="du">${hm(secs)}</span></div>
+      <div class="pills">${sumPills(r.summary)}</div>${bar}
+      <div class="route">${route||"No places recorded in this session."}</div></div>
+    ${open?`<div class="rcb">${r.chapters.length?r.chapters.map((ch,i)=>chHtml(r,ch,i)).join(""):'<div class="empty-msg">No places recorded in this session.</div>'}
+      <div class="rcf"><button class="btn" data-act="events">Show all events of this session</button></div></div>`:""}</div>`;
+}
+function renderRecap(){
+  if(recView==="places") return renderPlaces();
+  const list=$("sesList");
+  if(!rec.sessions.length){ list.innerHTML=`<div class="empty-msg">${meta.import&&meta.import.running?"Importing your history ...":"No sessions in this time range."}</div>`; return; }
+  if(!recOpen) recOpen=new Set(rec.sessions.length<=3?rec.sessions.map(r=>r.sid):[rec.sessions[0].sid]);
+  const q=query.toLowerCase(), rs=rec.sessions.filter(r=>!q||recText(r).includes(q));
+  list.innerHTML = rs.length ? rs.map((r,i)=>recHtml(r,recOpen.has(r.sid)||(!!q&&i<5))).join("") : `<div class="empty-msg">No session matches "${esc(query)}".</div>`;
+}
+function placeDid(p){ const a=Object.entries(p.acts).sort((x,y)=>y[1]-x[1]).map(([k,n])=>`${n>1?n+"× ":""}${k.toLowerCase()}`);
+  if(p.contracts) a.push(plural(p.contracts,"contract")+" accepted"); if(p.spent) a.push(num(p.spent)+" aUEC spent"); return a.slice(0,3).join(" · ")||"–"; }
+function renderPlaces(){
+  const list=$("sesList"), q=query.toLowerCase();
+  if(!rec.places.length){ list.innerHTML=`<div class="empty-msg">No places in this time range.</div>`; return; }
+  const sys={}; for(const r of rec.sessions) for(const ch of r.chapters){ const k=ch.system||"Unknown"; sys[k]=(sys[k]||0)+Math.max(0,(chEnd(ch,r)-new Date(ch.start))/1000); }
+  const ss=Object.entries(sys).sort((a,b)=>b[1]-a[1]), tot=ss.reduce((a,x)=>a+x[1],0)||1;
+  const ps=rec.places.filter(p=>!q||(p.place+" "+(p.system||"")+" "+placeDid(p)).toLowerCase().includes(q));
+  list.innerHTML=`<div class="srvsum"><div class="st"><b>${num(rec.places.length)}</b><span>places</span></div>
+    <div class="st"><b>${num(rec.places.reduce((a,p)=>a+p.visits,0))}</b><span>stops</span></div>
+    <div class="regions"><div class="rbar">${ss.map(([k,v])=>`<i style="--rc:${sc(k)};width:${(100*v/tot).toFixed(2)}%" title="${esc(k)}"></i>`).join("")}</div>
+    <div class="rleg">${ss.map(([k,v])=>`<span style="--rc:${sc(k)}"><b>${esc(k)}</b> ${Math.round(100*v/tot)}% · ${hm(v)}</span>`).join("")}</div></div></div>
+    <table class="srvtab plc"><thead><tr><th>Place</th><th>System</th><th class="num">Stops</th><th class="num">Sessions</th><th class="num">Time</th><th>What you did there</th><th>Last visit</th></tr></thead><tbody>`+
+    ps.map(p=>`<tr data-place="${esc(p.place)}" title="Show the sessions with this place"><td><span class="pn">${hl(p.place)}</span></td>
+      <td>${p.system?`<span class="sys" style="--sc:${sc(p.system)}">${esc(p.system)}</span>`:""}</td><td class="num">${num(p.visits)}</td><td class="num">${num(p.sessions)}</td>
+      <td class="num">~${hm(p.seconds)}</td><td>${hl(placeDid(p))}</td><td>${shortDT(p.last)}</td></tr>`).join("")+`</tbody></table>`+
+    (ps.length?"":`<div class="empty-msg">No place matches "${esc(query)}".</div>`)+
+    `<p class="more">Times are estimates: the game logs when you arrive somewhere, not when you leave.</p>`;
+}
+function setRecView(v){ recView=v; $("btnRecap").classList.toggle("on",v==="sessions"); $("btnPlaces").classList.toggle("on",v==="places"); renderRecap(); $("sesList").scrollTop=0; }
+$("btnRecap").addEventListener("click",()=>setRecView("sessions"));
+$("btnPlaces").addEventListener("click",()=>setRecView("places"));
+$("sesList").addEventListener("click",e=>{
+  const row=e.target.closest("tr[data-place]");
+  if(row){ $("search").value=row.dataset.place; setQuery(row.dataset.place); setRecView("sessions"); $("sesList").scrollTop=0; return; }
+  const card=e.target.closest(".rc"); if(!card) return; const r=rec.sessions.find(x=>x.sid===card.dataset.sid); if(!r) return;
+  const clear=()=>{ $("search").value=""; query=""; };   // the search found the stop; the events don't contain it
+  if(e.target.closest('[data-act="events"]')){ clear(); setRange({preset:"custom",from:r.start,to:r.live?null:r.end,sid:r.sid}); showTab("ev"); return; }
+  const chp=e.target.closest(".chp");
+  if(chp){ if(window.getSelection().toString()) return; const ch=r.chapters[+chp.dataset.i]; const last=ch===r.chapters[r.chapters.length-1];
+    clear(); setRange({preset:"custom",from:ch.start,to:r.live&&last?null:ch.end}); showTab("ev"); return; }
+  if(e.target.closest(".rch")){ recOpen=recOpen||new Set(); recOpen.has(r.sid)?recOpen.delete(r.sid):recOpen.add(r.sid); renderRecap(); }
+});
+setInterval(()=>{ if(tab==="ses" && rec.sessions.some(r=>r.live)) renderRecap(); },60000);
+
+/* ---------- history list ---------- */
 function loadSessions(){ api("/api/sessions").then(res=>{ sessions=res.sessions||[]; renderSessions(); }); }
 function renderSessions(){
   $("sesCount").textContent = sessions.length ? num(sessions.length)+" sessions" : "";
@@ -2778,22 +3261,10 @@ $("sessions").addEventListener("click",e=>{ const el=e.target.closest(".ses"); i
   const s=sessions.find(x=>x.id===el.dataset.id); if(!s) return;
   setRange({preset:"custom",from:s.first_ts,to:s.live?null:s.last_ts,sid:s.id}); });
 
-/* ---------- now panel and status ---------- */
-function setNow(id,val,html){ const el=$(id); if(val){ el.innerHTML=html??esc(val); el.classList.remove("empty"); } else { el.textContent="–"; el.classList.add("empty"); } }
+/* ---------- header and status ---------- */
 function renderState(){
   const s=state;
   $("hHandle").textContent=s.handle||"–"; $("hChannel").textContent=s.channel||"–"; $("hVersion").textContent=s.version||"–";
-  setNow("nLoc",s.location); setNow("nJur",s.jurisdiction);
-  let zone=null, zh=null;
-  if(s.armistice===true){ zone=1; zh='<span class="pill safe">Armistice</span>'; }
-  else if(s.monitored===true){ zone=1; zh='<span class="pill risk">Monitored</span>'; }
-  else if(s.monitored===false){ zone=1; zh='<span class="pill danger">Unmonitored</span>'; }
-  else if(s.armistice===false){ zone=1; zh='<span class="pill risk">No armistice</span>'; }
-  setNow("nZone",zone,zh);
-  const ship=s.ship||s.pilot_ship;
-  setNow("nShip",ship, ship? esc(ship)+(s.ship_owner&&s.ship_owner!==s.handle?`<div class="note">owned by ${esc(s.ship_owner)}</div>`:"") : null);
-  setNow("nQt",s.qt_target);
-  setNow("nShard",s.shard, s.shard? esc(s.shard)+(s.region?`<div class="note">${esc(s.region)}</div>`:"") : null);
   updateCounts();
 }
 function renderMeta(){
@@ -2830,13 +3301,11 @@ function renderStatus(){
 setInterval(renderStatus,5000);
 
 /* ---------- settings ---------- */
-function openSettings(){ $("settings").classList.add("show"); $("setMsg").textContent=""; $("autoMsg").textContent="";
-  $("quitHint").textContent = meta.auto_quit===false ? "This copy was started with Windows and keeps running in the background until you quit it here." : "Stops the tracker. Closing all dashboard tabs does the same after a few seconds.";
+function openSettings(){ $("settings").classList.add("show"); $("setMsg").textContent="";
   $("setIntro").textContent = meta.needs_setup ? "Couldn't find your Game.log automatically. Pick the Game.log file, or your StarCitizen or LIVE folder." : "Where Star Citizen writes its log. Pick the Game.log file, or your StarCitizen or LIVE folder.";
   api("/api/config").then(c=>{
     $("setPath").value=c.log||"";
-    $("setFound").innerHTML=(c.detected||[]).length ? "<p class='hint'>Found on this PC:</p>"+c.detected.map(d=>`<button data-path="${esc(d.path)}"><span class="p">${esc(d.path)}</span><span class="m">${esc(d.channel)}${d.modified?" · "+esc(d.modified.replace("T"," ")):""}</span></button>`).join("") : "";
-    $("setAutoSec").style.display=c.autostart&&c.autostart.supported?"":"none"; $("setAuto").checked=!!(c.autostart&&c.autostart.enabled);
+    $("setDefault").textContent=c.default_log||""; $("setDefault").dataset.path=c.default_log||"";
     const h=c.history||{}; $("setHistory").textContent=`${num(h.sessions)} sessions · ${num(h.events)} events`+(h.oldest?` since ${new Date(h.oldest).toLocaleDateString("en-GB",{day:"numeric",month:"short",year:"numeric"})}`:"")+` · stored in ${c.data_dir}`;
   });
 }
@@ -2845,7 +3314,7 @@ $("btnSettings").addEventListener("click",openSettings); $("hPath").addEventList
 $("setClose").addEventListener("click",closeSettings);
 $("settings").addEventListener("click",e=>{ if(e.target.id==="settings") closeSettings(); });
 document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeSettings(); });
-$("setFound").addEventListener("click",e=>{ const b=e.target.closest("button"); if(b){ $("setPath").value=b.dataset.path; saveLog(); } });
+$("setDefault").addEventListener("click",()=>{ const p=$("setDefault").dataset.path; if(p){ $("setPath").value=p; saveLog(); } });
 function msg(id,text,cls){ const m=$(id); m.textContent=text; m.className="msg "+(cls||""); }
 function saveLog(){ const v=$("setPath").value.trim(); if(!v){ msg("setMsg","Enter a path first.","err"); return; }
   $("setSave").disabled=true; msg("setMsg","Checking ...");
@@ -2857,9 +3326,6 @@ $("setPath").addEventListener("keydown",e=>{ if(e.key==="Enter") saveLog(); });
 $("setBrowse").addEventListener("click",()=>{ $("setBrowse").disabled=true; msg("setMsg","A file dialog opened. If you don't see it, check your taskbar.");
   api("/api/browse",{}).then(r=>{ $("setBrowse").disabled=false;
     if(r.error) msg("setMsg",r.error,"err"); else if(r.path){ $("setPath").value=r.path; saveLog(); } else msg("setMsg",""); }); });
-$("setAuto").addEventListener("change",e=>{ const want=e.target.checked; msg("autoMsg","Saving ...");
-  api("/api/autostart",{enabled:want}).then(r=>{ if(r.error){ e.target.checked=!want; msg("autoMsg",r.error,"err"); return; }
-    e.target.checked=r.enabled; msg("autoMsg", r.enabled?"SC Log Tracker will start with Windows.":"Autostart turned off.","ok"); }); });
 $("btnQuit").addEventListener("click",()=>{ const q=$("btnQuit");
   if(!q.classList.contains("armed")){ q.classList.add("armed"); q.textContent="Click again to quit"; setTimeout(()=>{ q.classList.remove("armed"); q.textContent="Quit SC Log Tracker"; },4000); return; }
   stopped=true; api("/api/quit",{}).finally(()=>{ closeSettings(); $("stopped").classList.add("show"); }); });
@@ -2871,7 +3337,7 @@ function handle(m){
     renderMeta(); renderState(); renderRange(); if(tab==="raw") renderRaw(); loadEvents(); loadSessions(); }
   else if(m.t==="batch"){
     if(m.raw.length){ raw.push(...m.raw); if(raw.length>MAX_RAW) raw.splice(0,raw.length-MAX_RAW); addRaw(m.raw); lastLineAt=Date.now(); }
-    state=m.state; renderState(); if(m.ev.length) addEvents(m.ev); renderStatus();
+    state=m.state; renderState(); if(m.ev.length){ addEvents(m.ev); if(inRange(m.ev[m.ev.length-1])) recSoon(); } renderStatus();
     if(m.ev.some(e=>e.ti==="Joined server"||/^(Exited to menu|Disconnected|Game closed|Crash!|Connection error)/.test(e.ti))) loadServers();
   }
   else if(m.t==="reset"){ raw=[]; state=m.state||{}; if(m.meta) meta=m.meta; renderMeta(); renderState(); if(tab==="raw") renderRaw(); if(m.note) toast(m.note); loadSessions(); }
@@ -2892,6 +3358,7 @@ $("btnExport").addEventListener("click",()=>{
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
 });
 renderRange();
+try{ showTab(localStorage.getItem("sclt.tab")||"ev"); }catch(e){ showTab("ev"); }
 connect();
 </script>
 </body>
