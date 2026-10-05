@@ -25,7 +25,7 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 - **Time range filter:** look at this session, today, the last 7 or 30 days, everything, or any period you pick by date and time. Click a session in the history list to jump to it.
 - **"Now" panel:** where you are, which jurisdiction you're in, whether you're in an armistice or monitored zone, your ship, your quantum target and your server.
 - **Readable names:** internal codes like `RR_P3_LEO` or `Outpost_OLP_Stanton2b_Attritus` become `Orbituary` and `Attritus (Daymar)`.
-- **Runs quietly:** no console window, optional start with Windows, and a single instance. Starting the app again just opens the dashboard.
+- **Runs quietly:** no console window, optional start with Windows, and a single instance. Starting the app again just opens the dashboard, and starting a newer version replaces an older one that is still running.
 - **Works with any install folder:** it finds your `Game.log` on its own, or you pick it in the settings.
 - **Raw log view, filters, search and JSON export.**
 - **Zero setup:** one file, no dependencies, works offline.
@@ -38,7 +38,9 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 2. Put it in any folder and double-click it.
 3. Your browser opens the dashboard at `http://127.0.0.1:8777`. The first start imports your old sessions in the background, which takes a few seconds to a minute.
 
-The app has no window of its own. It keeps running in the background until you click **Settings → Quit SC Log Tracker**. Double-clicking it again simply reopens the dashboard.
+The app has no window of its own. It keeps running in the background, even when you close the browser tab, until you click **Settings → Quit SC Log Tracker**. Double-clicking it again simply reopens the dashboard.
+
+**Updating:** download the new `SC-Log-Tracker.exe` and start it. If the old version is still running, the new one closes it and takes over; your history and settings stay.
 
 > **Windows SmartScreen** may say "Windows protected your PC" the first time. That's because the app isn't code-signed (a certificate costs money every year). Click **More info → Run anyway**. The exe is built from this repository's source by GitHub Actions; you can check every step in the [release workflow](.github/workflows/release.yml).
 
@@ -52,7 +54,7 @@ cd sc-log-tracker
 python sc_log_tracker.py
 ```
 
-Or download the source zip from the [latest release](https://github.com/DefaultHahn/sc-log-tracker/releases/latest) and double-click `start.bat`. The Python version also prints events to its console window.
+Or download the source zip from the [latest release](https://github.com/DefaultHahn/sc-log-tracker/releases/latest) and double-click `start.bat`. It starts the tracker in the background without a console window, just like the Windows app. Started with `python sc_log_tracker.py` in a terminal, it also prints the events there.
 
 ## Usage
 
@@ -155,7 +157,7 @@ Open **Settings** and click **Browse ...**, or paste the path to your Star Citiz
 <details>
 <summary><b>How do I stop it?</b></summary>
 
-**Settings → Quit SC Log Tracker**. If you started the Python version in a console, Ctrl+C works too.
+**Settings → Quit SC Log Tracker** ends the app completely. Closing the browser tab doesn't stop it on purpose, so it can keep recording while you play. If you started the Python version in a terminal, Ctrl+C works too.
 </details>
 
 <details>

@@ -5,6 +5,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-05
+
+### Fixed
+- `start.bat` no longer leaves a console window open: it starts the Python version in the background (with `pyw`/`pythonw`), just like the Windows app. Quitting from the dashboard now ends everything.
+- Starting a newer version while an older one is still running in the background (for example after downloading an update) now replaces the old one instead of opening its dashboard. Open dashboard tabs reload to the new version on their own.
+- On Windows, the tracker could share its port with another program instead of moving on to the next free one.
+- Error messages show up as a message box when there is no console (also for the Python version started with `start.bat`).
+
 ## [1.2.0] - 2026-10-05
 
 ### Added
@@ -53,7 +61,8 @@ First public release.
 - Replay of old sessions (`--replay`), JSON export, automatic `Game.log` discovery, new-session detection.
 - Windows executable built by GitHub Actions for every release.
 
-[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.1...HEAD
+[1.2.1]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.0...v1.2.1
 [1.2.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/DefaultHahn/sc-log-tracker/releases/tag/v1.0.0

@@ -43,7 +43,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 APP_NAME = "SC Log Tracker"
 REPO_URL = "https://github.com/DefaultHahn/sc-log-tracker"
 DEFAULT_PORT = 8777
@@ -1266,7 +1266,8 @@ class Hub:
 
     # -- browsers ---------------------------------------------------------------
     def snapshot(self):
-        return {"t": "snapshot", "raw": list(self.raw), "state": dict(self.parser.state), "meta": dict(self.meta)}
+        return {"t": "snapshot", "v": __version__, "raw": list(self.raw), "state": dict(self.parser.state),
+                "meta": dict(self.meta)}
 
     def subscribe(self):
         q = queue.Queue(maxsize=3000)
@@ -1794,6 +1795,8 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length) or b"{}")
         except (ValueError, OSError):
             body = {}
+        if not isinstance(body, dict):
+            body = {}
         path, hub = urllib.parse.urlsplit(self.path).path, self.hub
         if path == "/api/config":
             if hub.mode != "live":
@@ -1818,8 +1821,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"error": f"Couldn't change the setting: {e}"}, 500)
         if path == "/api/quit":
             self._json({"ok": True})
-            con("Quit from the dashboard.", "90")
-            threading.Timer(0.3, lambda: os._exit(0)).start()
+            con(str(body.get("reason") or "Quit from the dashboard.")[:200], "90")
+            threading.Timer(0.3, lambda: exit_app()).start()
             return
         self._send(404, "text/plain", b"not found")
 
@@ -1869,12 +1872,19 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.flush()
 
 
+class Server(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second program bind a port that is already in use,
+    # so the "next free port" fallback would never kick in. Other systems need it for
+    # quick restarts.
+    allow_reuse_address = os.name != "nt"
+
+
 def start_server(hub, port):
     Handler.hub = hub
     last_err = None
     for p in range(port, port + PORT_RANGE):
         try:
-            srv = ThreadingHTTPServer(("127.0.0.1", p), Handler)
+            srv = Server(("127.0.0.1", p), Handler)
             srv.daemon_threads = True
             return srv, p
         except OSError as e:
@@ -1882,17 +1892,83 @@ def start_server(hub, port):
     raise SystemExit(f"No free port found from {port} upwards: {last_err}")
 
 
+LOCAL = urllib.request.build_opener(urllib.request.ProxyHandler({}))   # never via a proxy
+
+
+def version_tuple(v):
+    """'1.10.2' -> (1, 10, 2), so versions compare correctly. Unknown parts count as 0."""
+    parts = []
+    for piece in str(v or "").split(".")[:4]:
+        m = re.match(r"\d+", piece.strip())
+        parts.append(int(m.group()) if m else 0)
+    return tuple(parts) or (0,)
+
+
+def ping(port, timeout=0.5):
+    """The /api/ping answer of an SC Log Tracker on this port, or None."""
+    try:
+        with LOCAL.open(f"http://127.0.0.1:{port}/api/ping", timeout=timeout) as r:
+            data = json.loads(r.read())
+    except Exception:  # noqa: BLE001 - nothing there, or something else
+        return None
+    return data if isinstance(data, dict) and data.get("app") == APP_NAME else None
+
+
 def find_running_instance(port):
-    """Port of an SC Log Tracker that is already running on this PC, or None."""
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    """(port, version) of an SC Log Tracker that is already running on this PC, or None."""
     for p in range(port, port + PORT_RANGE):
-        try:
-            with opener.open(f"http://127.0.0.1:{p}/api/ping", timeout=0.5) as r:
-                if json.loads(r.read()).get("app") == APP_NAME:
-                    return p
-        except Exception:  # noqa: BLE001 - nothing there, or something else
-            continue
+        info = ping(p)
+        if info:
+            return p, str(info.get("version") or "0")
     return None
+
+
+def stop_instance(port, timeout=10):
+    """Ask the tracker on this port to quit and wait until it's gone. True if it stopped."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/api/quit", method="POST",
+        data=json.dumps({"reason": f"Replaced by version {__version__}."}).encode(),
+        headers={"Content-Type": "application/json", CSRF_HEADER: "1"})
+    try:
+        with LOCAL.open(req, timeout=3) as r:
+            r.read()
+    except Exception:  # noqa: BLE001 - an old version that can't quit, or already gone
+        pass
+    end = time.time() + timeout
+    while time.time() < end:
+        if not ping(port, timeout=0.3):
+            time.sleep(0.3)              # let the old process release the database and port
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def take_over_or_open(port, open_browser, version=None):
+    """Handle an instance that is already running. True if this process should just exit.
+
+    An older version is stopped so this one can take over (e.g. after an update while the
+    old one still runs in the background). The same or a newer version is simply opened.
+    """
+    version = version or __version__
+    running = find_running_instance(port)
+    if not running:
+        return False
+    rport, rversion = running
+    if version_tuple(rversion) < version_tuple(version):
+        con(f"Version {rversion} is running on port {rport}, replacing it with {version} ...")
+        if stop_instance(rport):
+            return False
+        con("The old version didn't quit, opening it instead.", "93")
+    url = f"http://127.0.0.1:{rport}/"
+    con(f"Already running, opening {url}")
+    if open_browser:
+        webbrowser.open(url)
+    return True
+
+
+def exit_app():
+    """End the whole process right away, including the threads that are still working."""
+    os._exit(0)
 
 
 # ---------------------------------------------------------------------------
@@ -1922,10 +1998,15 @@ def print_event(e):
     con(f"[{local_time(e['ts'])}] {label} {e['ti']}{detail}", CAT_ANSI.get(e["c"]))
 
 
+NO_CONSOLE = False      # started without a console (the .exe, pythonw, autostart)
+
+
 def setup_output():
-    """The Windows app has no console: write messages to tracker.log in the data folder instead."""
+    """Without a console, write messages to tracker.log in the data folder instead."""
+    global NO_CONSOLE
     if sys.stdout is not None and sys.stderr is not None:
         return
+    NO_CONSOLE = True
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         log = DATA_DIR / "tracker.log"
@@ -1942,7 +2023,7 @@ def setup_output():
 
 def show_error(message):
     con(message, "91")
-    if getattr(sys, "frozen", False) and os.name == "nt":
+    if os.name == "nt" and (NO_CONSOLE or getattr(sys, "frozen", False)):
         try:
             import ctypes
             ctypes.windll.user32.MessageBoxW(0, str(message), APP_NAME, 0x10)
@@ -2075,14 +2156,8 @@ def run(args):
 
     con(f"{APP_NAME} {__version__}", "96")
 
-    if not args.replay:
-        running = find_running_instance(args.port)
-        if running:
-            url = f"http://127.0.0.1:{running}/"
-            con(f"Already running, opening {url}")
-            if open_browser:
-                webbrowser.open(url)
-            return
+    if not args.replay and take_over_or_open(args.port, open_browser):
+        return
 
     replay_last = bool(args.replay) and args.replay.lower() in ("last", "latest")
     live_path = None if args.replay and not replay_last else resolve_log(args.log)
@@ -2724,7 +2799,8 @@ $("btnQuit").addEventListener("click",()=>{ const q=$("btnQuit");
 
 /* ---------- connection ---------- */
 function handle(m){
-  if(m.t==="snapshot"){ raw=m.raw; state=m.state; meta=m.meta; lastLineAt=meta.last_read||0;
+  if(m.t==="snapshot"){ if(m.v && m.v!=="{{VERSION}}"){ location.reload(); return; }   // a newer version took over
+    raw=m.raw; state=m.state; meta=m.meta; lastLineAt=meta.last_read||0;
     renderMeta(); renderState(); renderRange(); if(tab==="raw") renderRaw(); loadEvents(); loadSessions(); }
   else if(m.t==="batch"){
     if(m.raw.length){ raw.push(...m.raw); if(raw.length>MAX_RAW) raw.splice(0,raw.length-MAX_RAW); addRaw(m.raw); lastLineAt=Date.now(); }
