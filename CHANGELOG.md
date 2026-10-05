@@ -12,6 +12,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 - Starting a newer version while an older one is still running in the background (for example after downloading an update) now replaces the old one instead of opening its dashboard. Open dashboard tabs reload to the new version on their own.
 - On Windows, the tracker could share its port with another program instead of moving on to the next free one.
 - Error messages show up as a message box when there is no console (also for the Python version started with `start.bat`).
+- `tracker.log` no longer fills up with harmless "connection aborted" errors when a dashboard tab is closed or reloaded.
 
 ## [1.2.0] - 2026-10-05
 

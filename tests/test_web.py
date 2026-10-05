@@ -148,3 +148,20 @@ def test_servers_endpoint(running):
     assert sum(v["live"] for v in data["visits"]) == 0   # the live session already ended (game closed)
     assert data["regions"][0]["region"] == "Europe"
     assert data["servers"][0]["shard"] == "pub_euw1b_12660092_100" and data["servers"][0]["visits"] == 2
+
+
+def test_closed_connections_are_not_logged(capsys):
+    srv = t.Server(("127.0.0.1", 0), t.Handler)
+    try:
+        try:
+            raise ConnectionAbortedError("tab closed")
+        except ConnectionAbortedError:
+            srv.handle_error(None, ("127.0.0.1", 1))
+        assert capsys.readouterr().err == ""
+        try:
+            raise ValueError("a real bug")
+        except ValueError:
+            srv.handle_error(None, ("127.0.0.1", 1))
+        assert "a real bug" in capsys.readouterr().err
+    finally:
+        srv.server_close()

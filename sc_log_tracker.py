@@ -1878,6 +1878,12 @@ class Server(ThreadingHTTPServer):
     # quick restarts.
     allow_reuse_address = os.name != "nt"
 
+    def handle_error(self, request, client_address):
+        # A browser closing or reloading a tab cuts its connections. That's normal, not an error.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
 
 def start_server(hub, port):
     Handler.hub = hub
