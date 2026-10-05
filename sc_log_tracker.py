@@ -31,6 +31,8 @@ import json
 import os
 import queue
 import re
+import select
+import socket
 import sqlite3
 import string
 import sys
@@ -43,7 +45,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 APP_NAME = "SC Log Tracker"
 REPO_URL = "https://github.com/DefaultHahn/sc-log-tracker"
 DEFAULT_PORT = 8777
@@ -54,6 +56,7 @@ CHANNELS = ("LIVE", "PTU", "EPTU", "TECH-PREVIEW", "HOTFIX")
 PARSER_VERSION = 2
 
 POLL_SECONDS = 0.25
+QUIT_GRACE = 5           # seconds after the last dashboard tab closed before the app quits
 READ_CHUNK = 4 * 1024 * 1024
 HEAD_BYTES = 256
 RAW_KEEP = 1500          # raw lines a newly connected browser receives
@@ -1259,6 +1262,8 @@ class Hub:
         self.announced = None
         self.raw = collections.deque(maxlen=RAW_KEEP)
         self.clients = set()
+        self.had_client = False      # a dashboard was opened at least once
+        self.empty_since = None      # when the last dashboard tab went away
         self.source = None
         self.importer = None
         self.meta = {"path": None, "mode": mode, "waiting": False, "needs_setup": False, "last_read": 0,
@@ -1273,18 +1278,31 @@ class Hub:
         q = queue.Queue(maxsize=3000)
         with self.lock:
             self.clients.add(q)
+            self.had_client, self.empty_since = True, None
             return q, self.snapshot()
 
     def unsubscribe(self, q):
         with self.lock:
-            self.clients.discard(q)
+            self._drop(q)
+
+    def _drop(self, q):
+        self.clients.discard(q)
+        if not self.clients and self.empty_since is None:
+            self.empty_since = time.time()
+
+    def dashboard_closed_for(self):
+        """Seconds since the last dashboard tab was closed, or None while one is open (or none ever was)."""
+        with self.lock:
+            if not self.had_client or self.clients or self.empty_since is None:
+                return None
+            return time.time() - self.empty_since
 
     def _send(self, q, msg):
         try:
             q.put_nowait(msg)
         except queue.Full:
             q.dead = True                # browser too slow: let it reconnect
-            self.clients.discard(q)
+            self._drop(q)
 
     def _broadcast(self, msg):
         for q in list(self.clients):
@@ -1578,7 +1596,7 @@ class ReplaySource(threading.Thread):
         if batch:
             self.hub.feed(batch)
         self.hub.set_meta(replay_done=True)
-        con("Replay finished. The page stays open, press Ctrl+C to quit.", "92")
+        con("Replay finished.", "92")
 
 
 # ---------------------------------------------------------------------------
@@ -1852,20 +1870,34 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Connection", "keep-alive")
         self.end_headers()
         q, snap = self.hub.subscribe()
+        last_write = time.time()
         try:
             self._sse(snap)
             while not getattr(q, "dead", False):
                 try:
-                    msg = q.get(timeout=15)
+                    msg = q.get(timeout=1)
                 except queue.Empty:
-                    self.wfile.write(b": ping\n\n")
-                    self.wfile.flush()
+                    if self._client_gone():
+                        break
+                    if time.time() - last_write >= 15:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+                        last_write = time.time()
                     continue
                 self._sse(msg)
+                last_write = time.time()
         except OSError:
             pass
         finally:
             self.hub.unsubscribe(q)
+
+    def _client_gone(self):
+        """True once the browser closed the connection (a browser never sends anything on it)."""
+        try:
+            readable, _, _ = select.select([self.connection], [], [], 0)
+            return bool(readable) and self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (OSError, ValueError):
+            return True
 
     def _sse(self, msg):
         self.wfile.write(b"data: " + json.dumps(msg, ensure_ascii=False).encode("utf-8") + b"\n\n")
@@ -1975,6 +2007,25 @@ def take_over_or_open(port, open_browser, version=None):
 def exit_app():
     """End the whole process right away, including the threads that are still working."""
     os._exit(0)
+
+
+class AutoQuit(threading.Thread):
+    """Quits the app once the dashboard has been closed. The game's logs are imported on the next start."""
+    daemon = True
+
+    def __init__(self, hub, grace=QUIT_GRACE):
+        super().__init__(name="autoquit")
+        self.hub = hub
+        self.grace = grace
+
+    def run(self):
+        while True:
+            time.sleep(0.5)
+            closed = self.hub.dashboard_closed_for()
+            if closed is not None and closed >= self.grace:
+                con("Dashboard closed, quitting.", "90")
+                exit_app()
+                return
 
 
 # ---------------------------------------------------------------------------
@@ -2132,7 +2183,8 @@ def parse_args(argv=None):
         epilog=REPO_URL)
     ap.add_argument("log", nargs="?", help="Game.log, LIVE folder or StarCitizen folder")
     ap.add_argument("--background", action="store_true",
-                    help="run without opening the browser and without console output (used for autostart)")
+                    help="run without browser and console output, and keep running when the dashboard "
+                         "is closed (used for autostart)")
     ap.add_argument("--replay", metavar="FILE",
                     help="replay a log file, not saved to history ('last' = newest file in logbackups)")
     ap.add_argument("--speed", type=float, default=30.0, help="replay speed (default 30x)")
@@ -2192,8 +2244,16 @@ def run(args):
         con("Couldn't find your Game.log. Choose it in the dashboard.", "93")
     if not args.replay:
         refresh_autostart()
+    hub.meta["auto_quit"] = not args.background
+    if not args.background:
+        # Started by you: close the dashboard and the app goes too. Started with Windows
+        # (--background): keep recording in the background until you quit it in the settings.
+        AutoQuit(hub).start()
     con(f"Viewer:   {url}", "92")
-    con("Press Ctrl+C or use Settings > Quit in the dashboard to stop.\n", "90")
+    if args.background:
+        con("Running in the background. Use Settings > Quit in the dashboard to stop.\n", "90")
+    else:
+        con("Closing the dashboard stops the tracker (or press Ctrl+C).\n", "90")
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()
     try:
@@ -2495,7 +2555,7 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
     </div>
     <div class="dsec" id="setAutoSec">
       <h4>Start with Windows</h4>
-      <label class="switch"><input type="checkbox" id="setAuto"><span>Start SC Log Tracker in the background when you sign in to Windows. It runs without a window and keeps your history up to date while you play. Open the dashboard any time by starting the app again.</span></label>
+      <label class="switch"><input type="checkbox" id="setAuto"><span>Start SC Log Tracker in the background when you sign in to Windows. That copy runs without a window and records live while you play, even when the dashboard is closed. Open the dashboard any time by starting the app again.</span></label>
       <div class="msg" id="autoMsg"></div>
     </div>
     <div class="dsec">
@@ -2505,7 +2565,7 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
     </div>
     <div class="dsec">
       <h4>Tracker</h4>
-      <div class="row"><button class="btn danger" id="btnQuit">Quit SC Log Tracker</button><span class="hint" id="quitHint">Stops the tracker. Start the app again to reopen it.</span></div>
+      <div class="row"><button class="btn danger" id="btnQuit">Quit SC Log Tracker</button><span class="hint" id="quitHint">Stops the tracker. Closing the dashboard does the same.</span></div>
     </div>
   </div>
 </div>
@@ -2771,6 +2831,7 @@ setInterval(renderStatus,5000);
 
 /* ---------- settings ---------- */
 function openSettings(){ $("settings").classList.add("show"); $("setMsg").textContent=""; $("autoMsg").textContent="";
+  $("quitHint").textContent = meta.auto_quit===false ? "This copy was started with Windows and keeps running in the background until you quit it here." : "Stops the tracker. Closing all dashboard tabs does the same after a few seconds.";
   $("setIntro").textContent = meta.needs_setup ? "Couldn't find your Game.log automatically. Pick the Game.log file, or your StarCitizen or LIVE folder." : "Where Star Citizen writes its log. Pick the Game.log file, or your StarCitizen or LIVE folder.";
   api("/api/config").then(c=>{
     $("setPath").value=c.log||"";

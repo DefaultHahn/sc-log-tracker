@@ -1,4 +1,5 @@
 """Web endpoints, settings and protection against requests from other websites."""
+import http.client
 import json
 import threading
 
@@ -165,3 +166,45 @@ def test_closed_connections_are_not_logged(capsys):
         assert "a real bug" in capsys.readouterr().err
     finally:
         srv.server_close()
+
+
+def open_dashboard(port):
+    """Connect like a browser tab: open the event stream and read the first message."""
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    conn.request("GET", "/stream")
+    resp = conn.getresponse()
+    assert resp.status == 200 and resp.fp.readline().startswith(b"data: ")
+    return conn, resp
+
+
+def close_dashboard(tab):
+    conn, resp = tab
+    resp.close()
+    conn.close()
+
+
+def test_closing_the_dashboard_quits(running, monkeypatch):
+    hub, port, _ = running
+    quit_called = threading.Event()
+    monkeypatch.setattr(t, "exit_app", quit_called.set)
+    assert hub.dashboard_closed_for() is None           # no dashboard yet: never quit on its own
+    t.AutoQuit(hub, grace=0.5).start()
+    tab = open_dashboard(port)
+    assert wait_for(lambda: hub.clients) and hub.dashboard_closed_for() is None
+    assert not quit_called.wait(1.5)                     # open tab: keeps running
+    close_dashboard(tab)
+    assert wait_for(lambda: hub.dashboard_closed_for() is not None, timeout=5)   # noticed within ~1 s
+    assert quit_called.wait(5)
+
+
+def test_reloading_the_dashboard_doesnt_quit(running, monkeypatch):
+    hub, port, _ = running
+    quit_called = threading.Event()
+    monkeypatch.setattr(t, "exit_app", quit_called.set)
+    t.AutoQuit(hub, grace=3).start()
+    tab = open_dashboard(port)
+    close_dashboard(tab)
+    assert wait_for(lambda: hub.dashboard_closed_for() is not None, timeout=5)
+    tab = open_dashboard(port)                           # the reloaded page connects again
+    assert not quit_called.wait(4)
+    close_dashboard(tab)

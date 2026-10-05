@@ -25,7 +25,7 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 - **Time range filter:** look at this session, today, the last 7 or 30 days, everything, or any period you pick by date and time. Click a session in the history list to jump to it.
 - **"Now" panel:** where you are, which jurisdiction you're in, whether you're in an armistice or monitored zone, your ship, your quantum target and your server.
 - **Readable names:** internal codes like `RR_P3_LEO` or `Outpost_OLP_Stanton2b_Attritus` become `Orbituary` and `Attritus (Daymar)`.
-- **Runs quietly:** no console window, optional start with Windows, and a single instance. Starting the app again just opens the dashboard, and starting a newer version replaces an older one that is still running.
+- **Runs quietly:** no console window, and it quits when you close the dashboard. Optional start with Windows, a single instance (starting the app again just opens the dashboard), and a newer version replaces an older one that is still running.
 - **Works with any install folder:** it finds your `Game.log` on its own, or you pick it in the settings.
 - **Raw log view, filters, search and JSON export.**
 - **Zero setup:** one file, no dependencies, works offline.
@@ -38,7 +38,7 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 2. Put it in any folder and double-click it.
 3. Your browser opens the dashboard at `http://127.0.0.1:8777`. The first start imports your old sessions in the background, which takes a few seconds to a minute.
 
-The app has no window of its own. It keeps running in the background, even when you close the browser tab, until you click **Settings → Quit SC Log Tracker**. Double-clicking it again simply reopens the dashboard.
+The app has no window of its own: the dashboard in your browser *is* the app. Close the tab and the tracker quits a few seconds later (or use **Settings → Quit SC Log Tracker**). Nothing gets lost while it's closed: Star Citizen keeps its logs, and the tracker imports them the next time you start it.
 
 **Updating:** download the new `SC-Log-Tracker.exe` and start it. If the old version is still running, the new one closes it and takes over; your history and settings stay.
 
@@ -54,7 +54,7 @@ cd sc-log-tracker
 python sc_log_tracker.py
 ```
 
-Or download the source zip from the [latest release](https://github.com/DefaultHahn/sc-log-tracker/releases/latest) and double-click `start.bat`. It starts the tracker in the background without a console window, just like the Windows app. Started with `python sc_log_tracker.py` in a terminal, it also prints the events there.
+Or download the source zip from the [latest release](https://github.com/DefaultHahn/sc-log-tracker/releases/latest) and double-click `start.bat`. It starts the tracker without a console window, just like the Windows app. Started with `python sc_log_tracker.py` in a terminal, it also prints the events there.
 
 ## Usage
 
@@ -82,7 +82,7 @@ The **Servers** tab lists every server (shard) you were on in the selected time 
 
 ### Start with Windows
 
-Turn on **Settings → Start with Windows** to have the tracker start in the background when you sign in. Your history then fills up live while you play, and the dashboard is one double-click away. Turn it off the same way. (This adds an entry for your user only, under *Settings → Apps → Startup* in Windows.)
+Turn on **Settings → Start with Windows** to have the tracker start in the background when you sign in. That copy keeps running while the dashboard is closed, so your history fills up live while you play, and the dashboard is one double-click away. Quit it with **Settings → Quit SC Log Tracker**. Turn autostart off the same way. (This adds an entry for your user only, under *Settings → Apps → Startup* in Windows.)
 
 ### Where your data is stored
 
@@ -94,7 +94,8 @@ Settings and the history live in `%LOCALAPPDATA%\SC Log Tracker` (on other syste
 sc_log_tracker.py [path] [options]
 
   path                  Game.log, LIVE folder or StarCitizen folder (optional)
-  --background          no browser, no console output (used for "Start with Windows")
+  --background          no browser, no console output, keeps running when the dashboard
+                        is closed (used for "Start with Windows")
   --replay FILE         replay a log file without saving it ("last" = newest file in logbackups)
   --speed N             replay speed, default 30 (= 30x real time)
   --port N              web port, default 8777
@@ -157,13 +158,13 @@ Open **Settings** and click **Browse ...**, or paste the path to your Star Citiz
 <details>
 <summary><b>How do I stop it?</b></summary>
 
-**Settings → Quit SC Log Tracker** ends the app completely. Closing the browser tab doesn't stop it on purpose, so it can keep recording while you play. If you started the Python version in a terminal, Ctrl+C works too.
+Close the dashboard tab: the tracker quits a few seconds later. **Settings → Quit SC Log Tracker** does the same right away. The copy started with Windows (if you turned that on) keeps running in the background until you quit it in the settings. In a terminal, Ctrl+C works too.
 </details>
 
 <details>
 <summary><b>Do I have to start it every time I play?</b></summary>
 
-No. Sessions you played without it are imported from Star Citizen's `logbackups` the next time you open it. Turn on **Start with Windows** if you want the history to update live while you play.
+No. Sessions you played without it are imported from Star Citizen's `logbackups` the next time you open it. Turn on **Start with Windows** if you want it to record live in the background while you play.
 </details>
 
 <details>
