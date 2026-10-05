@@ -5,6 +5,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and 
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-05
+
+### Added
+- **Server history:** a new **Servers** tab lists every shard you joined in the selected time range, with region, start, end, duration and why you left (game closed, moved to another server, disconnected, crash). Rejoins of the same shard within five minutes count as one visit. A **By server** view shows visits and total time per shard, and a bar shows your time per region. Click a visit to see its events.
+- The "Now" panel shows the region of the current server.
+
+### Changed
+- Every server join is now an event, not just a change of shard. Your history is re-imported once from the logs that still exist (takes a few seconds).
+
 ## [1.1.0] - 2026-10-05
 
 ### Added
@@ -44,6 +53,7 @@ First public release.
 - Replay of old sessions (`--replay`), JSON export, automatic `Game.log` discovery, new-session detection.
 - Windows executable built by GitHub Actions for every release.
 
-[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/DefaultHahn/sc-log-tracker/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/DefaultHahn/sc-log-tracker/releases/tag/v1.0.0

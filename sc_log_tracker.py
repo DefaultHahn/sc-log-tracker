@@ -43,7 +43,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 APP_NAME = "SC Log Tracker"
 REPO_URL = "https://github.com/DefaultHahn/sc-log-tracker"
 DEFAULT_PORT = 8777
@@ -51,7 +51,7 @@ PORT_RANGE = 15
 CHANNELS = ("LIVE", "PTU", "EPTU", "TECH-PREVIEW", "HOTFIX")
 # Bump when the parser produces different events, so stored history is re-imported
 # from every log file that still exists.
-PARSER_VERSION = 1
+PARSER_VERSION = 2
 
 POLL_SECONDS = 0.25
 READ_CHUNK = 4 * 1024 * 1024
@@ -298,6 +298,21 @@ def pretty_dest(s):
     return pretty_loc(s), True
 
 
+REGIONS = {"euw": "Europe", "euc": "Europe", "eun": "Europe", "use": "US East", "usw": "US West",
+           "usc": "US Central", "apse": "Australia", "ape": "Asia", "apne": "Asia", "aps": "Asia",
+           "sae": "South America"}
+SHARD_PARTS_RE = re.compile(r"^(?P<env>[a-z]+)_(?P<region>[a-z]+?)(?P<rn>\d+)(?P<zone>[a-z]?)_(?P<build>\d+)_(?P<num>\d+)$")
+
+
+def shard_info(shard):
+    """pub_euw1b_12660092_110 -> region 'Europe', build '12660092', server number '110'."""
+    m = SHARD_PARTS_RE.match(shard or "")
+    if not m:
+        return {"region": "Unknown", "code": "", "build": "", "number": ""}
+    code = m["region"] + m["rn"]
+    return {"region": REGIONS.get(m["region"], code.upper()), "code": code, "build": m["build"], "number": m["num"]}
+
+
 def clean_notif(text):
     """HUD text without markup and language-pack decorations."""
     t = re.sub(r"</?EM\d>", "", text or "").replace("\xa0", " ")
@@ -325,6 +340,11 @@ def to_dt(ts):
         return datetime.fromisoformat(ts[:19] + "+00:00")
     except (TypeError, ValueError):
         return None
+
+
+def seconds_between(a, b):
+    da, db = to_dt(a), to_dt(b)
+    return int((db - da).total_seconds()) if da and db else 0
 
 
 def local_time(ts):
@@ -433,7 +453,7 @@ class Parser:
             "location": None, "jurisdiction": None,
             "armistice": None, "monitored": None,
             "ship": None, "ship_owner": None, "pilot_ship": None,
-            "qt_target": None,
+            "qt_target": None, "region": None,
             "qt_jumps": 0, "qt_selected": 0,
             "contracts_acc": 0, "contracts_done": 0, "contracts_failed": 0,
             "objectives_done": 0, "missions_ended": 0,
@@ -445,11 +465,14 @@ class Parser:
         }
 
     # -- helpers --------------------------------------------------------------
-    def _ev(self, out, ts, cat, title, detail="", level="info", raw=""):
+    def _ev(self, out, ts, cat, title, detail="", level="info", raw="", x=None):
         self.seq += 1
         self.state["events"] += 1
-        out.append({"id": self.seq, "ts": ts, "c": cat, "ti": title, "d": detail,
-                    "lv": level, "n": self.line_no, "raw": raw[:700]})
+        e = {"id": self.seq, "ts": ts, "c": cat, "ti": title, "d": detail,
+             "lv": level, "n": self.line_no, "raw": raw[:700]}
+        if x is not None:
+            e["x"] = x                       # machine-readable value, e.g. the shard id
+        out.append(e)
 
     def _changed(self, key, value):
         if self.last.get(key) == value:
@@ -807,9 +830,10 @@ class Parser:
             return
         if "<Join PU>" in line:
             m = SHARD_RE.search(line)
-            if m and m.group(1) != S["shard"]:
-                S["shard"] = m.group(1)
-                ev("session", "Joined server", m.group(1))
+            if m:
+                shard = m.group(1)
+                S["shard"], S["region"] = shard, shard_info(shard)["region"]
+                self._ev(out, ts, "session", "Joined server", f"{shard} · {S['region']}", "info", line, x=shard)
             return
         if all(k in line for k in PU_JOIN):
             return ev("session", "Entered the universe", "persistent universe loaded", "good")
@@ -1054,7 +1078,7 @@ class Store:
         handle TEXT, version TEXT, channel TEXT, parser INTEGER DEFAULT 0, updated REAL);
     CREATE TABLE IF NOT EXISTS events(
         id INTEGER PRIMARY KEY, sid TEXT NOT NULL, seq INTEGER NOT NULL,
-        ts TEXT, c TEXT, ti TEXT, d TEXT, lv TEXT, n INTEGER, raw TEXT,
+        ts TEXT, c TEXT, ti TEXT, d TEXT, lv TEXT, n INTEGER, raw TEXT, x TEXT,
         UNIQUE(sid, seq));
     CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
     CREATE INDEX IF NOT EXISTS sessions_first ON sessions(first_ts);
@@ -1072,6 +1096,9 @@ class Store:
                 self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(self.SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(events)")}
+            if "x" not in cols:                  # databases from 1.1.0
+                self.db.execute("ALTER TABLE events ADD COLUMN x TEXT")
             self.db.commit()
 
     def close(self):
@@ -1100,8 +1127,8 @@ class Store:
             cur = self.db.cursor()
             for e in events:
                 cur.execute(
-                    "INSERT OR IGNORE INTO events(sid, seq, ts, c, ti, d, lv, n, raw) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (sid, e["id"], e["ts"], e["c"], e["ti"], e["d"], e["lv"], e["n"], e["raw"]))
+                    "INSERT OR IGNORE INTO events(sid, seq, ts, c, ti, d, lv, n, raw, x) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (sid, e["id"], e["ts"], e["c"], e["ti"], e["d"], e["lv"], e["n"], e["raw"], e.get("x")))
                 if cur.rowcount:
                     new.append(dict(e, id=cur.lastrowid, seq=e["id"], sid=sid))
             self.db.commit()
@@ -1142,9 +1169,67 @@ class Store:
         with self.lock:
             total = self.db.execute(f"SELECT COUNT(*) FROM events WHERE {cond}", args).fetchone()[0]
             rows = self.db.execute(
-                f"SELECT id, sid, seq, ts, c, ti, d, lv, n, raw FROM events WHERE {cond} "
+                f"SELECT id, sid, seq, ts, c, ti, d, lv, n, raw, x FROM events WHERE {cond} "
                 "ORDER BY ts DESC, id DESC LIMIT ?", args + [limit]).fetchall()
         return [dict(r) for r in reversed(rows)], total
+
+    VISIT_ENDS = ("Exited to menu", "Disconnected from server", "Disconnected for inactivity",
+                  "Game closed", "Crash!")
+    REJOIN_GAP = 300                         # same server again within 5 minutes counts as one visit
+
+    def server_visits(self, frm=None, to=None):
+        """Server visits overlapping the time range, newest first.
+        A visit runs from joining a shard until leaving it, joining another one, or the session's end."""
+        cond, args = ["s.events > 0", "s.first_ts IS NOT NULL"], []
+        if to:
+            cond.append("s.first_ts <= ?")
+            args.append(to)
+        if frm:
+            cond.append("s.last_ts >= ?")
+            args.append(frm)
+        ends = ",".join("?" * len(self.VISIT_ENDS))
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT e.sid, e.ts, e.ti, e.x, s.last_ts FROM events e JOIN sessions s ON s.id = e.sid "
+                f"WHERE {' AND '.join(cond)} AND e.ts IS NOT NULL "
+                f"AND (e.ti = 'Joined server' OR e.ti IN ({ends}) OR e.ti LIKE 'Connection error%') "
+                "ORDER BY e.sid, e.ts, e.id", args + list(self.VISIT_ENDS)).fetchall()
+        visits, current, last_sid, session_end = [], None, None, None
+        for r in rows:
+            if r["sid"] != last_sid:
+                if current:
+                    current.update(end=session_end, left=None, open=True)
+                current, last_sid, session_end = None, r["sid"], r["last_ts"]
+            if r["ti"] == "Joined server":
+                shard = r["x"] or ""
+                if current:
+                    current.update(end=r["ts"], left="Moved to another server")
+                prev = visits[-1] if visits and visits[-1]["sid"] == r["sid"] else None
+                if (prev and prev["shard"] == shard and prev["end"]
+                        and seconds_between(prev["end"], r["ts"]) <= self.REJOIN_GAP):
+                    prev.update(end=None, left=None, rejoins=prev["rejoins"] + 1)
+                    current = prev
+                else:
+                    current = {"sid": r["sid"], "shard": shard, **shard_info(shard), "start": r["ts"],
+                               "end": None, "left": None, "rejoins": 0, "open": False}
+                    visits.append(current)
+            elif current:
+                current.update(end=r["ts"], left=r["ti"])
+                current = None
+        if current:
+            current.update(end=session_end, left=None, open=True)
+        out = []
+        for v in visits:
+            v["end"] = v["end"] or v["start"]
+            # overlap with the range; a visit that only touches its edge doesn't count
+            if to and (v["start"] > to or (v["start"] == to and v["end"] > to)):
+                continue
+            if frm and (v["end"] < frm or (v["end"] == frm and v["start"] < frm)):
+                continue
+            v["seconds"] = max(0, seconds_between(v["start"], v["end"]))
+            out.append(v)
+        out.sort(key=lambda v: v["start"], reverse=True)
+        return out
 
     def stats(self):
         with self.lock:
@@ -1671,6 +1756,26 @@ class Handler(BaseHTTPRequestHandler):
                 limit = EVENTS_LIMIT
             events, total = hub.store.events(frm, to, limit)
             return self._json({"events": events, "total": total, "limit": limit})
+        if url.path == "/api/servers":
+            frm = (qs.get("from") or [None])[0] or None
+            to = (qs.get("to") or [None])[0] or None
+            visits = hub.store.server_visits(frm, to)
+            servers, regions = {}, {}
+            for v in visits:
+                v["live"] = bool(v["open"] and v["sid"] == hub.sid and hub.mode == "live")
+                s = servers.setdefault(v["shard"], {"shard": v["shard"], "region": v["region"], "build": v["build"],
+                                                    "number": v["number"], "visits": 0, "seconds": 0,
+                                                    "first": v["start"], "last": v["end"], "live": False})
+                s["visits"] += 1
+                s["seconds"] += v["seconds"]
+                s["first"], s["last"] = min(s["first"], v["start"]), max(s["last"], v["end"])
+                s["live"] = s["live"] or v["live"]
+                r = regions.setdefault(v["region"], {"region": v["region"], "visits": 0, "seconds": 0})
+                r["visits"] += 1
+                r["seconds"] += v["seconds"]
+            return self._json({"visits": visits,
+                               "servers": sorted(servers.values(), key=lambda s: s["last"], reverse=True),
+                               "regions": sorted(regions.values(), key=lambda r: r["seconds"], reverse=True)})
         if url.path == "/api/sessions":
             rows = hub.store.sessions()
             for r in rows:
@@ -2158,6 +2263,27 @@ section.feed{display:flex;flex-direction:column;min-height:0;min-width:0}
 .ev.fresh{animation:fresh 3s ease-out}
 @keyframes fresh{from{background:rgba(60,200,242,.16)}to{background:transparent}}
 .more{padding:14px;text-align:center;font-size:12px;color:var(--faint)}
+.srvsum{display:flex;flex-wrap:wrap;gap:18px 28px;align-items:center;padding:14px;border-bottom:1px solid var(--line)}
+.srvsum .st b{display:block;font-size:20px;font-weight:650;font-variant-numeric:tabular-nums;line-height:1.15}
+.srvsum .st span{font-size:11px;color:var(--muted)}
+.regions{flex:1;min-width:260px;display:flex;flex-direction:column;gap:7px}
+.rbar{display:flex;height:8px;border-radius:4px;overflow:hidden;background:var(--line)}
+.rbar i{display:block;height:100%;background:var(--rc)}
+.rleg{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:12px;color:var(--muted)}
+.rleg span::before{content:"";display:inline-block;width:8px;height:8px;border-radius:2px;background:var(--rc);margin-right:6px}
+.rleg b{color:var(--text);font-weight:600}
+.vis{display:grid;grid-template-columns:104px 92px minmax(0,1fr) 84px;gap:12px;align-items:baseline;padding:8px 14px;border-bottom:1px solid var(--line2);cursor:pointer}
+.vis:hover{background:#0a1220}
+.vis .t{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.rg{font-size:11px;font-weight:600;color:var(--rc);border:1px solid color-mix(in srgb,var(--rc) 45%,transparent);border-radius:999px;padding:0 8px;justify-self:start;white-space:nowrap}
+.sh{font-family:var(--mono);font-size:12.5px;color:var(--text)}
+.vis .d{color:var(--faint);font-size:12px;margin-left:8px}
+.vis .du{text-align:right;font-variant-numeric:tabular-nums;color:var(--muted);font-size:12.5px}
+.srvtab{width:100%;border-collapse:collapse;font-size:12.5px}
+.srvtab th{position:sticky;top:0;background:#08101b;text-align:left;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:600;padding:7px 14px;border-bottom:1px solid var(--line)}
+.srvtab td{padding:7px 14px;border-bottom:1px solid var(--line2);color:var(--muted)}
+.srvtab td.num,.srvtab th.num{text-align:right;font-variant-numeric:tabular-nums}
+.srvtab tr:hover td{background:#0a1220}
 .rawlist{font-family:var(--mono);font-size:12px;line-height:1.5;padding:4px 0}
 .rl{display:grid;grid-template-columns:64px minmax(0,1fr);padding:0 14px 0 11px;border-left:3px solid transparent;color:#8193ad}
 .rl .tx{white-space:pre-wrap;word-break:break-all}
@@ -2257,16 +2383,20 @@ mark{background:rgba(60,200,242,.28);color:inherit;border-radius:2px}
   <section class="feed">
     <div class="tabs">
       <button class="tab on" data-tab="ev">Events<span class="n" id="cEv">0</span></button>
+      <button class="tab" data-tab="srv" title="Which servers (shards) you were on">Servers<span class="n" id="cSrv">0</span></button>
       <button class="tab" data-tab="raw" title="Raw lines of the current game session">Raw log<span class="n" id="cRaw">0</span></button>
       <span class="rangelabel" id="rangeLabel"></span>
     </div>
     <div class="toolbar">
       <span id="chips" style="display:contents"></span>
+      <button class="btn on" id="btnVisits" style="display:none" title="Every time you joined a server">Visits</button>
+      <button class="btn" id="btnByServer" style="display:none" title="One row per server">By server</button>
       <button class="btn" id="btnHits" style="display:none" title="Only show lines that produced an event">Matches only</button>
       <button class="btn on" id="btnScroll" style="display:none">Auto-scroll</button>
       <input class="search" id="search" type="search" placeholder="Search ..." autocomplete="off">
     </div>
     <div class="list" id="evList"></div>
+    <div class="list" id="srvList" style="display:none"></div>
     <div class="list rawlist" id="rawList" style="display:none"></div>
   </section>
 </main>
@@ -2359,6 +2489,7 @@ function customChanged(){ const f=fromInput($("rFrom").value), t=fromInput($("rT
 $("rFrom").addEventListener("change",customChanged); $("rTo").addEventListener("change",customChanged);
 
 function loadEvents(){
+  loadServers();
   const b=bounds(), seq=++loadSeq; const qs=new URLSearchParams();
   if(b.from) qs.set("from",b.from); if(b.to) qs.set("to",b.to);
   api("/api/events?"+qs).then(res=>{ if(seq!==loadSeq||res.error) return;
@@ -2436,14 +2567,59 @@ $("chips").addEventListener("dblclick",ev=>{ const c=ev.target.closest(".chip");
   const k=c.dataset.c; active = (active.size===1 && active.has(k)) ? new Set(Object.keys(CATS)) : new Set([k]); renderChips(); renderEvents(); });
 document.querySelectorAll(".tab").forEach(b=>b.addEventListener("click",()=>{
   tab=b.dataset.tab; document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("on",x===b));
-  $("evList").style.display=tab==="ev"?"":"none"; $("rawList").style.display=tab==="raw"?"":"none";
+  $("evList").style.display=tab==="ev"?"":"none"; $("rawList").style.display=tab==="raw"?"":"none"; $("srvList").style.display=tab==="srv"?"":"none";
   $("btnHits").style.display=$("btnScroll").style.display=tab==="raw"?"":"none";
-  renderChips(); if(tab==="raw") renderRaw(); }));
+  $("btnVisits").style.display=$("btnByServer").style.display=tab==="srv"?"":"none";
+  renderChips(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); }));
 let searchTimer=null;
-$("search").addEventListener("input",e=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{ query=e.target.value.trim(); renderEvents(); if(tab==="raw") renderRaw(); },150); });
+$("search").addEventListener("input",e=>{ clearTimeout(searchTimer); searchTimer=setTimeout(()=>{ query=e.target.value.trim(); renderEvents(); if(tab==="raw") renderRaw(); if(tab==="srv") renderServers(); },150); });
 $("btnHits").addEventListener("click",()=>{ onlyHits=!onlyHits; $("btnHits").classList.toggle("on",onlyHits); renderRaw(); });
 $("btnScroll").addEventListener("click",()=>{ autoScroll=!autoScroll; $("btnScroll").classList.toggle("on",autoScroll); if(autoScroll){ const l=$("rawList"); l.scrollTop=l.scrollHeight; } });
 function updateCounts(){ $("cEv").textContent=num(total); $("cRaw").textContent=num(state.lines); }
+
+/* ---------- servers ---------- */
+let srv={visits:[],servers:[],regions:[]}, srvView="visits", srvSeq=0;
+const REGION_COLOR={"Europe":"var(--c-travel)","US East":"var(--c-mission)","US West":"var(--c-law)","US Central":"var(--c-law)",
+  "Australia":"var(--c-economy)","Asia":"var(--c-social)","South America":"var(--c-ship)"};
+const rc=r=>REGION_COLOR[r]||"var(--c-notice)";
+function hm(sec){ sec=Math.max(0,sec|0); const h=sec/3600|0, m=(sec%3600)/60|0; return h?`${h}h ${pad(m)}m`:`${m}m`; }
+function loadServers(){ const b=bounds(), seq=++srvSeq, qs=new URLSearchParams();
+  if(b.from) qs.set("from",b.from); if(b.to) qs.set("to",b.to);
+  api("/api/servers?"+qs).then(r=>{ if(seq!==srvSeq||r.error) return; srv=r; $("cSrv").textContent=num(r.visits.length); if(tab==="srv") renderServers(); }); }
+function liveSecs(v){ return v.live ? Math.max(v.seconds,(Date.now()-new Date(v.start))/1000) : v.seconds; }
+function srvMatch(text){ return !query || text.toLowerCase().includes(query.toLowerCase()); }
+function renderServers(){
+  const list=$("srvList"); const vs=srv.visits.filter(v=>srvMatch(v.shard+" "+v.region));
+  if(!srv.visits.length){ list.innerHTML=`<div class="empty-msg">No server visits in this time range.</div>`; return; }
+  const total=srv.regions.reduce((a,r)=>a+r.seconds,0)||1;
+  let html=`<div class="srvsum"><div class="st"><b>${num(srv.visits.length)}</b><span>visits</span></div>
+    <div class="st"><b>${num(srv.servers.length)}</b><span>servers</span></div>
+    <div class="st"><b>${hm(srv.visits.reduce((a,v)=>a+liveSecs(v),0))}</b><span>online</span></div>
+    <div class="regions"><div class="rbar">${srv.regions.map(r=>`<i style="--rc:${rc(r.region)};width:${(100*r.seconds/total).toFixed(2)}%" title="${esc(r.region)}"></i>`).join("")}</div>
+    <div class="rleg">${srv.regions.map(r=>`<span style="--rc:${rc(r.region)}"><b>${esc(r.region)}</b> ${Math.round(100*r.seconds/total)}% · ${hm(r.seconds)} · ${num(r.visits)} visit${r.visits===1?"":"s"}</span>`).join("")}</div></div></div>`;
+  if(srvView==="visits"){
+    let last=null;
+    for(const v of vs){ const k=dayKey(v.start); if(k!==last){ html+=dayHtml(v.start); last=k; }
+      const why=v.left?({"Exited to menu":"exited to menu","Disconnected from server":"disconnected","Disconnected for inactivity":"kicked for inactivity","Game closed":"game closed","Crash!":"game crashed","Moved to another server":"moved to another server"}[v.left]||v.left.toLowerCase()):(v.live?"still here":"");
+      const extra=[v.rejoins?`rejoined ${v.rejoins}×`:"", why].filter(Boolean).join(" · ");
+      html+=`<div class="vis" data-i="${srv.visits.indexOf(v)}" title="Show the events of this visit"><span class="t">${tLocal(v.start).slice(0,5)}–${v.live?"now":tLocal(v.end).slice(0,5)}</span>
+        <span class="rg" style="--rc:${rc(v.region)}">${esc(v.region)}</span>
+        <div><span class="sh">${hl(v.shard)}</span>${extra?`<span class="d">${esc(extra)}</span>`:""}${v.live?'<span class="badge">LIVE</span>':""}</div>
+        <span class="du">${hm(liveSecs(v))}</span></div>`; }
+    if(!vs.length) html+=`<div class="empty-msg">No server matches the search.</div>`;
+  } else {
+    const ss=srv.servers.filter(s=>srvMatch(s.shard+" "+s.region));
+    html+=`<table class="srvtab"><thead><tr><th>Server</th><th>Region</th><th class="num">Visits</th><th class="num">Time</th><th>First seen</th><th>Last seen</th></tr></thead><tbody>`+
+      ss.map(s=>`<tr><td><span class="sh">${hl(s.shard)}</span>${s.live?'<span class="badge">LIVE</span>':""}</td><td><span class="rg" style="--rc:${rc(s.region)}">${esc(s.region)}</span></td>
+        <td class="num">${num(s.visits)}</td><td class="num">${hm(s.seconds)}</td><td>${shortDT(s.first)}</td><td>${s.live?"now":shortDT(s.last)}</td></tr>`).join("")+`</tbody></table>`;
+  }
+  list.innerHTML=html;
+}
+$("srvList").addEventListener("click",e=>{ const el=e.target.closest(".vis"); if(!el) return; const v=srv.visits[+el.dataset.i]; if(!v) return;
+  setRange({preset:"custom",from:v.start,to:v.live?null:v.end}); document.querySelector('.tab[data-tab="ev"]').click(); });
+$("btnVisits").addEventListener("click",()=>{ srvView="visits"; $("btnVisits").classList.add("on"); $("btnByServer").classList.remove("on"); renderServers(); });
+$("btnByServer").addEventListener("click",()=>{ srvView="servers"; $("btnByServer").classList.add("on"); $("btnVisits").classList.remove("on"); renderServers(); });
+setInterval(()=>{ if(tab==="srv" && srv.visits.some(v=>v.live)) renderServers(); },30000);
 
 /* ---------- sessions ---------- */
 function loadSessions(){ api("/api/sessions").then(res=>{ sessions=res.sessions||[]; renderSessions(); }); }
@@ -2475,7 +2651,8 @@ function renderState(){
   setNow("nZone",zone,zh);
   const ship=s.ship||s.pilot_ship;
   setNow("nShip",ship, ship? esc(ship)+(s.ship_owner&&s.ship_owner!==s.handle?`<div class="note">owned by ${esc(s.ship_owner)}</div>`:"") : null);
-  setNow("nQt",s.qt_target); setNow("nShard",s.shard);
+  setNow("nQt",s.qt_target);
+  setNow("nShard",s.shard, s.shard? esc(s.shard)+(s.region?`<div class="note">${esc(s.region)}</div>`:"") : null);
   updateCounts();
 }
 function renderMeta(){
@@ -2552,6 +2729,7 @@ function handle(m){
   else if(m.t==="batch"){
     if(m.raw.length){ raw.push(...m.raw); if(raw.length>MAX_RAW) raw.splice(0,raw.length-MAX_RAW); addRaw(m.raw); lastLineAt=Date.now(); }
     state=m.state; renderState(); if(m.ev.length) addEvents(m.ev); renderStatus();
+    if(m.ev.some(e=>e.ti==="Joined server"||/^(Exited to menu|Disconnected|Game closed|Crash!|Connection error)/.test(e.ti))) loadServers();
   }
   else if(m.t==="reset"){ raw=[]; state=m.state||{}; if(m.meta) meta=m.meta; renderMeta(); renderState(); if(tab==="raw") renderRaw(); if(m.note) toast(m.note); loadSessions(); }
   else if(m.t==="meta"){ meta=m.meta; renderMeta(); }

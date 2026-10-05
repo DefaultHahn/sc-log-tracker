@@ -89,3 +89,12 @@ def test_ping_without_proxy(running):
     _, port, _ = running
     with OPENER.open(f"http://127.0.0.1:{port}/api/ping", timeout=5) as r:
         assert json.loads(r.read())["app"] == t.APP_NAME
+
+
+def test_servers_endpoint(running):
+    _, port, _ = running
+    data = json.loads(request(port, "/api/servers")[1])
+    assert len(data["visits"]) == 2                  # live session + one backup
+    assert sum(v["live"] for v in data["visits"]) == 0   # the live session already ended (game closed)
+    assert data["regions"][0]["region"] == "Europe"
+    assert data["servers"][0]["shard"] == "pub_euw1b_12660092_100" and data["servers"][0]["visits"] == 2

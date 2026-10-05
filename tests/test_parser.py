@@ -166,3 +166,13 @@ def test_more_notifications():
                        n("You have left the party.", 3),
                        n("Item Bricked: Your RSI Polaris and 59 attached item(s) are now bricked and will no longer function.", 4)])
     assert titles(events) == ["Objective failed", "Contract withdrawn", "Left party", "Item bricked"]
+
+
+def test_every_server_join_is_an_event():
+    def j(m, shard):
+        return f"<2026-10-03T20:{m:02d}:00.000Z> [Notice] <Join PU> address[192.0.2.1] port[1] shard[{shard}] locationId[1]"
+    p, events = parse([j(0, "pub_euw1b_1_110"), j(5, "pub_euw1b_1_110"), j(9, "pub_use1b_1_250")])
+    assert titles(events) == ["Joined server"] * 3
+    assert [e["x"] for e in events] == ["pub_euw1b_1_110", "pub_euw1b_1_110", "pub_use1b_1_250"]
+    assert events[2]["d"] == "pub_use1b_1_250 · US East"
+    assert p.state["region"] == "US East"

@@ -21,6 +21,7 @@ SC Log Tracker follows your `Game.log` while you play, turns the raw lines into 
 
 - **Live event feed:** quantum jumps, locations, jurisdictions, armistice zones, ships you board, contracts and objectives, purchases, blueprints, injuries, deaths, crimes, party activity, crashes and disconnects.
 - **Complete history:** every session is saved to a local archive. On every start the tracker also imports the logs Star Citizen keeps in `logbackups`, so sessions you played while it wasn't running are filled in, going back as far as those backups go.
+- **Server history:** every shard you joined, when and for how long, with its region (Europe, US East, Australia, Asia ...). See your time per region and per server, and click a visit to see what happened there.
 - **Time range filter:** look at this session, today, the last 7 or 30 days, everything, or any period you pick by date and time. Click a session in the history list to jump to it.
 - **"Now" panel:** where you are, which jurisdiction you're in, whether you're in an armistice or monitored zone, your ship, your quantum target and your server.
 - **Readable names:** internal codes like `RR_P3_LEO` or `Outpost_OLP_Stanton2b_Attritus` become `Orbituary` and `Attritus (Daymar)`.
@@ -71,6 +72,12 @@ You don't need to keep the tracker running while you play: Star Citizen moves ev
 
 Use **Time range** on the left to choose what the event feed shows. Leave **To** empty to keep following live; set it to look at a fixed period. The **History** list shows every session with its date, length and number of events.
 
+### Server history
+
+The **Servers** tab lists every server (shard) you were on in the selected time range, for example `pub_euw1b_12660092_110` in Europe. A visit lasts from joining a shard until you leave it, move to another one (e.g. through a party launch) or close the game. Rejoining the same shard within five minutes counts as the same visit. Switch to **By server** for one row per shard with your number of visits and total time, and see at the top how your time splits between regions. Click a visit to show its events.
+
+<img src="docs/screenshot-servers.png" alt="Servers tab: server visits with region, duration and time per region" width="100%">
+
 ### Start with Windows
 
 Turn on **Settings → Start with Windows** to have the tracker start in the background when you sign in. Your history then fills up live while you play, and the dashboard is one double-click away. Turn it off the same way. (This adds an entry for your user only, under *Settings → Apps → Startup* in Windows.)
@@ -105,6 +112,7 @@ The `.exe` takes the same options, e.g. `SC-Log-Tracker.exe --replay last`. To t
 | **Category chips** | Click to show or hide a category. Double-click to show only that one. |
 | **Event row** | Click to show the original log line. |
 | **History list** | Click a session to show just that session. |
+| **Servers** | Click a visit to show its events. Search works here too, e.g. `use1` for US East. |
 | **Raw log** | The current game session's lines. Scroll up to pause auto-scroll. |
 | **Export** | Downloads the events of the selected time range as JSON. |
 
